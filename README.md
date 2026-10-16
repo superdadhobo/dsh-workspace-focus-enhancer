@@ -1,0 +1,119 @@
+# dsh-workspace-focus-enhancer
+
+dsh工作区专注增强——让 DeepSeek Harness 侧边栏的工作区列表始终围绕「你正在干的事」组织。
+
+> **一句话介绍**：正在干活的工作区自动排到最前面、一键图钉置顶、点开一个自动收起其他、当前工作区高亮、会话状态一目了然（等你回答 / 异常中断 / 进行中 / 完成未读）、会话收藏。
+
+**当前适配版本：DeepSeek Harness `0.2.0-rc.2`。** DSH 处于早期快速迭代阶段，升级后若插件失效，欢迎[提 Issue](https://github.com/superdadhobo/dsh-workspace-focus-enhancer/issues)。
+
+---
+
+## 功能特性
+
+1. **工作区自动排序**：工作区进入工作状态时自动靠前；它的上级工作区也会前移，让树形视图收起时仍能看到正在工作的分支。
+   - 同时兼容「按工作区」平铺和「按工作区树」。只向上提升必要的父级，不把同一目录下的空闲子工作区整组捎带到前面。
+   - 新建工作区、移动会话及会话开始或结束时自动重新整理；状态查询也会检查遗漏的变化，相同顺序不会反复写盘。
+2. **工作区置顶**：鼠标悬停在工作区卡片上时显示图钉 📌 按钮，点击即可永久固定置顶，谁也挤不掉它。
+3. **分层排序**：
+   - 第一梯队：用户手动固定置顶的工作区（按图钉顺序排列）；
+   - 第二梯队：当前正在干活的工作区（按最新动工时间先后排列）；
+   - 第三梯队：普通空闲工作区。
+   - **工作区内会话**沿用官方侧栏自己的排序（「最近更新」或你手动拖出的顺序），本插件不做改动。
+4. **工作状态徽标**：工作区名称前显示一个状态徽标，按紧急程度取第一优先：
+   - 🟠 橙色问号：有会话在等你回答或批准；
+   - 🔴 红色感叹号：有会话异常中断，点开该会话后自动消失；
+   - 🟢 旋转圈：有会话正在工作；
+   - 🟢 绿色对勾：有会话已完成但你还没看；
+   - 空闲时不显示。
+   - 状态有两条来源，同时生效、按行取更紧急的那个：页面自己的实时会话状态表，以及主机接口（2 秒一次）。**仅在树形视图中，上级收起时，子工作区的徽标才会上浮到真实的、已收起的最近可见父级**。筛选或搜索隐藏的独立工作区不会把徽标挂到其他工作区上。
+   - 绿色对勾只在「这条回复你确实没看过」时出现：会话在你眼前跑完的，算你看过了，切走也不会补一个对勾出来。
+   - **会话行自己的圆点也跟着修正**：官方那个圆点只知道「在跑 / 跑完了」，不知道「跑挂了」，所以中断的会话本来会显示成绿色的完成点。现在中断的会话行圆点变红，和工作区上的红叹号一致；点开这条会话，红点消失。
+5. **无关工作区自动折叠**：点开一个工作区，其他展开着的自动收起；它的上级目录和子目录不受影响，所以嵌套视图里刚点开的行不会消失。
+   - 点击标题展开时，一次提交目标展开和其他分支收起；手动收起标题也使用相同的位置保护。切换期间统一处理列表原生移动动画与浏览器滚动补偿，按最终布局定位。
+   - 尽量让刚点击的标题留在原来的可视位置；到达滚动边界时停在最近可达的位置，保证标题可见，不添加空白占位。继续滚动、触摸或点击时立即交还操作。
+   - 自动收起的工作区会记住此前「显示更多」的会话数量；手动收起仍沿用页面默认的数量重置。
+6. **高亮当前工作区**：把正在看的那个会话所属的工作区**连同它展开的会话一起**框一圈主题色边框；工作区收起时框住那一条，折叠状态下也照样能定位。
+7. **会话收藏**：鼠标移到任一会话上，行首出现 ☆，点击即收藏（实心 ★）。
+   - 会话露着时，星标画在**会话行**上（文字前，排在状态图标之前）；
+   - 工作区折叠、会话被藏时，星标**上浮到工作区卡片**（文字后），多个收藏显示 ★ 加数量；父级也折叠时继续逐级上浮；
+   - 星标与绿勾/红叹号/橙问号**互不遮挡**：状态图标在文字前、星标数量在文字后；
+   - 侧边栏「工作区」标题右侧（搜索按钮左边）有 ★ 按钮，点开列出全部收藏，点一条即打开该会话（会话藏在折叠工作区里也能打开）。
+
+## 控制面板
+
+侧边栏「插件」→ 本插件详情页，共 7 个独立开关：
+
+- 平铺四项：工作区置顶、工作区自动排序、无关工作区自动折叠、高亮当前工作区。
+- 一个可展开的「工作区内会话状态感知」分组，收纳 3 个徽标开关；分组标题旁标出当前是「全部开启 / 部分开启 n/3 / 已关闭」。
+- 关掉任何一个只影响对应行为。
+
+## 安装
+
+### 方式一：npm 包名（推荐）
+
+侧边栏 **插件 → 添加插件**，输入：
+
+```
+dsh-workspace-focus-enhancer
+```
+
+安装源选 npm 官方源或中国大陆镜像源均可（插件发布在这两个源上）。
+
+### 方式二：GitHub 仓库
+
+**插件 → 添加插件**，输入仓库地址：
+
+```
+https://github.com/superdadhobo/dsh-workspace-focus-enhancer
+```
+
+> 网络无法直连 GitHub 时，安装对话框会提供「改用国内镜像」。
+
+### 安装后
+
+- 安装完成点**立即启用**即可；尚未启用时去插件列表打开本插件的开关。
+- 宿主端功能（排序、置顶、收藏存储）需要重启 DeepSeek Harness 后完全生效；页面端功能（徽标、折叠、高亮）刷新页面即生效。
+- 插件升级：先卸载再安装新版（DSH 暂不支持自动更新）。
+
+### 数据说明
+
+- 置顶名单、排序开关、会话收藏保存在 `~/.dsh/storages/` 下的 `workspace-pins.json`、`workspace-order-settings.json`、`workspace-favorites.json`，换浏览器、清缓存后自动从主机读取。
+- 卸载插件不会删除这三个文件；想彻底清掉再手动删除即可。
+
+## 安全说明
+
+- 插件的 6 个接口只接受同机的请求，并且完整复刻了官方 `/api` 栅栏的三项判定：`Host` 头必须指向本机回环地址（防 DNS 重绑定）、`Sec-Fetch-Site` 不得为 `cross-site`、携带 `Origin` 时必须同源。
+- 请求体只接受 `application/json`（与官方 RPC 桥一致），不认 `text/plain` 等可绕过预检的内容类型。
+- 名单文件以临时文件 + 改名的方式原子落盘，权限 0600，与存储后端的其他文件一致。
+
+## English
+
+**dsh-workspace-focus-enhancer** enhances the DeepSeek Harness web sidebar:
+
+- **Auto-order**: workspaces with running sessions move to the front; ancestors move up so busy branches stay visible in the collapsed tree view.
+- **Pin**: hover a workspace card and click 📌 to pin it to the top, permanently.
+- **Three-tier ordering**: pinned → busy (newest first) → idle.
+- **Status badges**: 🟠 waiting for you · 🔴 interrupted · 🟢 running · ✅ done unread — badges float up to the nearest visible ancestor in tree view; interrupted sessions get a red dot on their row too.
+- **Auto-collapse**: opening a workspace collapses unrelated expanded ones, with scroll position preserved.
+- **Current highlight**: the workspace owning the session you're viewing gets a themed outline, even when collapsed.
+- **Favorites**: star sessions; stars float up to collapsed workspace cards with counts, and a ★ button next to the sidebar title lists them all.
+
+All seven features are individually toggleable in the plugin's detail page (sidebar → Plugins).
+
+### Install
+
+1. Open the **Plugins** page in the DSH sidebar.
+2. Click **Add plugin**, then enter either:
+   - the npm package name: `dsh-workspace-focus-enhancer`, or
+   - the GitHub repo: `https://github.com/superdadhobo/dsh-workspace-focus-enhancer`
+3. Click **Install**, then **Enable**. Restart DSH to activate the host-side features.
+
+Tested against DeepSeek Harness `0.2.0-rc.2`. If a DSH upgrade breaks something, please [open an issue](https://github.com/superdadhobo/dsh-workspace-focus-enhancer/issues).
+
+## 支持
+
+如果这个插件对你有帮助，欢迎给仓库点个 Star ⭐，也欢迎提 Issue 交流想法。
+
+## License
+
+[MIT](./LICENSE) © 2026 superdadhobo

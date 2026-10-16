@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH Workspace Focus Enhancer",
+    "description": "Workspace list enhancements: pin workspaces to the top, float busy ones forward, collapse the others when you open one, and outline the workspace holding the session on screen together with its expanded sessions. Open workspaces get a recessed fill. A status badge before the name shows the most urgent session state (orange question = waiting for you, red exclamation = failed, spinner = running, green check = finished unread); collapsed groups lift their badge to a visible ancestor. Sessions can be starred (the star climbs onto a collapsed workspace with a count, and a sidebar button lists every favourite). The plugin page offers seven switches."
+  }
+}

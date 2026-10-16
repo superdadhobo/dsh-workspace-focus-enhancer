@@ -1,0 +1,5 @@
+# Mount the workspace-order host service when this package is registered as a
+# DeepSeek Harness profile bundle.
+- insert:
+    - id: workspace-order
+      name: "dsh-workspace-focus-enhancer"
