@@ -48,34 +48,42 @@ window.__ModuleLoader__.load({
 
     const CSS = `
       /*
-       * Status palette, declared on the body element because that is where the
-       * page puts its own alias tokens — a definition higher up the tree would
-       * not see them and would silently fall back.
+       * Status palette: exactly one value per meaning, declared on the body
+       * element because that is where the page puts its own alias tokens — a
+       * definition higher up the tree would not see them and would silently
+       * fall back. Every place this plugin paints a state reads one of these
+       * three names, so a colour can never drift between two of them.
        *
-       * The page's green and amber are brand colours made to fill large
-       * surfaces. Drawn as a 14px badge stroke on the light sidebar the green
-       * sits at about 1.6:1, which is why the finished state reads washed out.
-       * Both are therefore taken down to 62% on the light theme, keeping the
-       * page's own hues: the green stays the same green, only deep enough to
-       * see. That measures about 3.9:1 for the green and 3.7:1 for the amber on
-       * the darkest surface a badge can land on — the recessed tray of an
-       * expanded workspace — which is the band status colours occupy on light
-       * backgrounds generally, and safely past the 3:1 floor an icon that
-       * carries meaning has to clear. The dark theme keeps the page's tokens
-       * untouched, since they already clear 5:1 on a near-black sidebar.
+       * Green needs a step of its own. The page's success green is a brand
+       * colour made to fill large surfaces, and drawn as a 14px badge stroke on
+       * the light sidebar it sits at about 1.6:1, which is why the finished
+       * state read washed out. It is taken down to 62% on the light theme,
+       * keeping the page's own hue — the green stays the same green, only deep
+       * enough to see. The dark theme keeps the page's token untouched, since
+       * it already clears 5:1 on a near-black sidebar.
        *
-       * Red is not listed. The page already gives it a deep step for light and a
-       * bright one for dark, which is exactly the treatment it failed to give
-       * green and amber, so it only needs to be referenced.
+       * Amber is referenced, not mixed, and that is the whole point of it. The
+       * favourite star and the waiting question mark are two different shapes
+       * carrying two different meanings, but they are the same orange, and a
+       * star drawn as a solid mass beside a hairline question mark only reads as
+       * one orange if both are literally one value. The star is the reference —
+       * it is the orange the user already sees and likes — so the badge takes
+       * the star's amber rather than the other way round. It is also the amber
+       * the rest of the harness uses for a warning.
+       *
+       * Red is referenced for the same reason, and it is what the page already
+       * gives a deep step for light and a bright one for dark — exactly the
+       * treatment it failed to give green. Both are theme tokens that resolve
+       * per theme on their own, so neither needs a dark-theme override here.
        */
       body {
         --dsh-order-green: color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 62%, #000);
-        --dsh-order-amber: color-mix(in srgb, var(--dsw-alias-state-warn-primary, #f59e0b) 62%, #000);
+        --dsh-order-amber: var(--dsw-alias-state-warn-primary, #f59e0b);
+        --dsh-order-red: var(--dsw-alias-state-error-primary, #ef4444);
       }
 
       body[data-ds-dark-theme] {
         --dsh-order-green: var(--dsw-alias-state-success-primary, #22c55e);
-        --dsh-order-amber: var(--dsw-alias-state-warn-primary, #f59e0b);
       }
 
       .dsh-order-pin-btn {
@@ -150,13 +158,13 @@ window.__ModuleLoader__.load({
 
       .dsh-order-star:hover {
         opacity: 1 !important;
-        color: var(--dsw-alias-state-warn-primary, #f5a623);
+        color: var(--dsh-order-amber);
         transform: scale(1.1);
       }
 
       .dsh-order-star[data-starred="true"] {
         opacity: 1 !important;
-        color: var(--dsw-alias-state-warn-primary, #f5a623);
+        color: var(--dsh-order-amber);
       }
 
       /*
@@ -210,7 +218,7 @@ window.__ModuleLoader__.load({
         gap: 2px;
         flex-shrink: 0;
         margin-left: 6px;
-        color: var(--dsw-alias-state-warn-primary, #f5a623);
+        color: var(--dsh-order-amber);
         font-size: 12px;
         line-height: 1;
         align-self: center;
@@ -270,7 +278,7 @@ window.__ModuleLoader__.load({
         outline-offset: -2px;
       }
       .dsh-order-workspace-header > .dsh-order-star-filter svg { width: 16px; height: 16px; display: block; pointer-events: none; }
-      .dsh-order-star-filter[data-active="true"] { color: var(--dsw-alias-state-warn-primary, #f5a623); }
+      .dsh-order-star-filter[data-active="true"] { color: var(--dsh-order-amber); }
 
       /* Search already hides the native actions; give its input the same room. */
       .dsh-order-workspace-header:has(> [class*="_searchSlotExpanded"]) > .dsh-order-star-filter,
@@ -325,7 +333,7 @@ window.__ModuleLoader__.load({
       }
 
       .dsh-order-star-menu-item:hover { background: var(--dsw-alias-interactive-bg-hover); }
-      .dsh-order-star-menu-item svg { width: 12px; height: 12px; flex: none; color: var(--dsw-alias-state-warn-primary, #f5a623); }
+      .dsh-order-star-menu-item svg { width: 12px; height: 12px; flex: none; color: var(--dsh-order-amber); }
 
       .dsh-order-star-menu-title {
         flex: 1;
@@ -368,7 +376,7 @@ window.__ModuleLoader__.load({
       }
 
       .dsh-order-state[data-state="error"] svg {
-        color: var(--dsw-alias-state-error-primary, #ef4444);
+        color: var(--dsh-order-red);
       }
 
       .dsh-order-state[data-state="done"] svg {
@@ -438,7 +446,7 @@ window.__ModuleLoader__.load({
        */
       .dsh-order-session-errored [data-state="done"],
       .dsh-order-session-errored [data-state="idle"] {
-        color: var(--dsw-alias-state-error-primary, #ef4444) !important;
+        color: var(--dsh-order-red) !important;
       }
     `;
 
@@ -608,7 +616,7 @@ window.__ModuleLoader__.load({
       }
 
       .dsh-order-panel-note { font-size: 12px; color: var(--dsw-alias-label-tertiary, rgba(255, 255, 255, 0.45)); padding-top: 8px; }
-      .dsh-order-panel-error { font-size: 12px; color: #f87171; padding-top: 8px; }
+      .dsh-order-panel-error { font-size: 12px; color: var(--dsh-order-red); padding-top: 8px; }
 
       /* One workspace toggle owns its final layout and scrolling together.
        * Native row glides use Web Animations, so animation:none is insufficient. */
