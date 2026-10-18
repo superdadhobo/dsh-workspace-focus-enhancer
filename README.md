@@ -4,9 +4,15 @@ dsh工作区专注增强——让 DeepSeek Harness 侧边栏的工作区列表�
 
 > **一句话介绍**：正在干活的工作区自动排到最前面、一键图钉置顶、点开一个自动收起其他、当前工作区高亮、会话状态一目了然（等你回答 / 异常中断 / 进行中 / 完成未读）、会话收藏。
 
-**当前适配版本：DeepSeek Harness `0.2.0-rc.2`。** DSH 处于早期快速迭代阶段，升级后若插件失效，欢迎[提 Issue](https://github.com/superdadhobo/dsh-workspace-focus-enhancer/issues)。
+**当前适配版本：DeepSeek Harness `0.2.1-rc.1`。** DSH 处于早期快速迭代阶段，升级后若插件失效，欢迎[提 Issue](https://github.com/superdadhobo/dsh-workspace-focus-enhancer/issues)。
 
 ---
+
+## 0.1.1 修复
+
+- 修复受信网页请求被错误拒绝为 403，声明原生认证依赖，并保留完整请求供原生检查。
+- 状态查询明确只接受 GET；认证异常不绕过检查。状态读取失败会在详情页显示原因，恢复后自动清除提示。
+- 设置、置顶、收藏与状态徽标通过独立数据的回归测试；不改写现有数据格式。
 
 ## 功能特性
 
@@ -49,7 +55,9 @@ dsh工作区专注增强——让 DeepSeek Harness 侧边栏的工作区列表�
 
 ## 安装
 
-### 方式一：npm 包名（推荐）
+0.1.1 修复版使用下方 GitHub 安装源，或通过自制插件更新器升级。本次未向 npm 发布。
+
+### 方式一：npm 包名
 
 侧边栏 **插件 → 添加插件**，输入：
 
@@ -59,7 +67,7 @@ dsh-workspace-focus-enhancer
 
 安装源选 npm 官方源或中国大陆镜像源均可（插件发布在这两个源上）。
 
-### 方式二：GitHub 仓库
+### 方式二：GitHub 仓库（0.1.1 推荐）
 
 **插件 → 添加插件**，输入仓库地址：
 
@@ -72,8 +80,8 @@ https://github.com/superdadhobo/dsh-workspace-focus-enhancer
 ### 安装后
 
 - 安装完成点**立即启用**即可；尚未启用时去插件列表打开本插件的开关。
-- 宿主端功能（排序、置顶、收藏存储）需要重启 DeepSeek Harness 后完全生效；页面端功能（徽标、折叠、高亮）刷新页面即生效。
-- 插件升级：先卸载再安装新版（DSH 暂不支持自动更新）。
+- 安装或更新后，通过 DSH 原生插件管理应用更改；当前版本支持热加载，页面可刷新以确认新代码。
+- 升级可使用自制插件更新器；置顶名单、收藏和七项开关保留。
 
 ### 数据说明
 
@@ -82,7 +90,9 @@ https://github.com/superdadhobo/dsh-workspace-focus-enhancer
 
 ## 安全说明
 
-- 插件的 6 个接口只接受同机的请求，并且完整复刻了官方 `/api` 栅栏的三项判定：`Host` 头必须指向本机回环地址（防 DNS 重绑定）、`Sec-Fetch-Site` 不得为 `cross-site`、携带 `Origin` 时必须同源。
+- 所有读取和写入接口都交给 DSH 原生 `connection` 服务检查登录、受信域名和请求来源。已登录的本机、局域网和受信反代网页使用相同规则，不再添加额外的“只允许本机”判断。
+- 未登录、错误域名和跨站来源仍由 DSH 拒绝；插件不设置受信域名、不修改原生认证，也不依赖双端切换插件。
+- `connection` 是必需依赖；认证服务缺失时插件不会绕过认证启动。
 - 请求体只接受 `application/json`（与官方 RPC 桥一致），不认 `text/plain` 等可绕过预检的内容类型。
 - 名单文件以临时文件 + 改名的方式原子落盘，权限 0600，与存储后端的其他文件一致。
 
@@ -106,9 +116,9 @@ All seven features are individually toggleable in the plugin's detail page (side
 2. Click **Add plugin**, then enter either:
    - the npm package name: `dsh-workspace-focus-enhancer`, or
    - the GitHub repo: `https://github.com/superdadhobo/dsh-workspace-focus-enhancer`
-3. Click **Install**, then **Enable**. Restart DSH to activate the host-side features.
+3. Click **Install**, then **Enable**. DSH applies the plugin through its native loader; reload the page to confirm the updated client. Use the GitHub source for this 0.1.1 repair.
 
-Tested against DeepSeek Harness `0.2.0-rc.2`. If a DSH upgrade breaks something, please [open an issue](https://github.com/superdadhobo/dsh-workspace-focus-enhancer/issues).
+Tested against DeepSeek Harness `0.2.1-rc.1`. If a DSH upgrade breaks something, please [open an issue](https://github.com/superdadhobo/dsh-workspace-focus-enhancer/issues).
 
 ## 支持
 

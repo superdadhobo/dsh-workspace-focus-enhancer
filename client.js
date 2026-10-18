@@ -554,9 +554,10 @@ window.__ModuleLoader__.load({
 
     /** Whether the Host has confirmed the current switches (false before its restart). */
     let hostAccepted = false;
+    let hostError = '';
     // The panel store carries both facts: the switches and where they persisted,
     // so a change to either repaints the card.
-    const settingsStore = uiAvailable ? createStore({ settings, hostAccepted }) : null;
+    const settingsStore = uiAvailable ? createStore({ settings, hostAccepted, hostError }) : null;
 
     /** All switches, so the summary and persistence cover every one. */
     const SETTING_ROWS = [
@@ -666,6 +667,15 @@ window.__ModuleLoader__.load({
     let unreadSet = new Set();
     /** The same fact per session, so the reply being read can be excluded. */
     let unreadSessionSet = new Set();
+    /**
+     * Whether the Host actually enumerated open per-session marks in the last
+     * status reply. `null` covers "not answered yet" and "answered before this
+     * feature existed": in both cases the per-session list is not evidence of
+     * absence, and the workspace-level list stays the only source of a green
+     * check. Without this flag a Host that reports nothing would erase a check
+     * the workspaces already carried.
+     */
+    let sessionMarksKnown = null;
     /**
      * The Host's own workspace tree, child -> parent. The page draws a collapsed
      * group's rows nowhere, so a hidden child's badge has to climb to an ancestor
@@ -952,6 +962,12 @@ window.__ModuleLoader__.load({
      * @returns a set of workspace ids.
      */
     function unreadWorkspaces(viewedId) {
+      // The per-session list is authoritative once the Host enumerates it: with
+      // it, the reply on screen can be excluded exactly, and a check the Host
+      // already retired in this cycle cannot come back from the workspace list.
+      if (sessionMarksKnown && !unreadSessionSet.size) {
+        if (Object.keys(workspaceOfSession).length) return new Set();
+      }
       if (!unreadSessionSet.size || !Object.keys(workspaceOfSession).length) return unreadSet;
       const out = new Set();
       for (const sessionId of unreadSessionSet) {
@@ -1098,6 +1114,28 @@ window.__ModuleLoader__.load({
       return left.length === right.length && left.every((id, i) => id === right[i]);
     }
 
+    /** A new set holding every member of both inputs; never mutates either. */
+    function unionOfSets(left, right) {
+      const merged = new Set(left);
+      for (const value of right) merged.add(value);
+      return merged;
+    }
+
+    /**
+     * Sessions the Host says one workspace holds. The Host's own map is the
+     * only enumeration available to this page for a workspace whose rows are
+     * hidden behind a collapsed ancestor.
+     * @returns the session ids, or an empty list when the Host named none.
+     */
+    function sessionsOfWorkspace(workspaceId) {
+      const out = [];
+      if (!workspaceId) return out;
+      for (const [sessionId, owner] of Object.entries(workspaceOfSession)) {
+        if (owner === workspaceId) out.push(sessionId);
+      }
+      return out;
+    }
+
     /** Save desired membership, so retrying a lost response cannot undo a star. */
     async function toggleFavorite(sessionId) {
       if (disposed || !sessionId) return false;
@@ -1177,9 +1215,11 @@ window.__ModuleLoader__.load({
       const polledPinsEpoch = pinsEpoch;
       try {
         const res = await fetch('/api/workspace-order/status');
+        if (!res.ok) throw Object.assign(new Error('Status request failed'), { status: res.status });
         if (res.ok) {
           const data = await res.json();
           if (disposed || pendingPins.size || polledPinsEpoch !== pinsEpoch) return;
+          setHostError('');
           pinnedSet = new Set(data.pinned || []);
           fallbackBusy = new Set(data.busy || []);
           erroredSet = new Set(data.errored || []);
@@ -1191,7 +1231,32 @@ window.__ModuleLoader__.load({
           // store still shows the orange question instead of a green spinner.
           waitingSet = new Set(data.waiting || []);
           unreadSet = new Set(data.unread || []);
-          unreadSessionSet = new Set(data.unreadSessions || []);
+          // A green check is the one fact with no second source: the page's own
+          // store only knows it for sessions it watched end, and the Host is the
+          // only place that remembers "finished, not read yet" across a page
+          // reload, a dropped socket, or a Host restart. So the session-level
+          // list may only ever ADD a check, never take one away — a turn that
+          // ended while the link was down is exactly the case this must show.
+          const listedUnread = Array.isArray(data.unreadSessions)
+            ? new Set(data.unreadSessions)
+            : (Array.isArray(data.unread) ? new Set() : null);
+          if (listedUnread === null) {
+            sessionMarksKnown = null;
+          } else {
+            sessionMarksKnown = true;
+            unreadSessionSet = unionOfSets(unreadSessionSet, listedUnread);
+            // Union alone would remember a check the Host has since retired, so
+            // the kept side is narrowed to replies that are still unread by the
+            // Host's own account: listed per session, or listed on a workspace
+            // whose exact session list is still the only thing the Host sent.
+            const stillUnread = new Set(listedUnread);
+            for (const workspaceId of unreadSet) {
+              for (const sessionId of sessionsOfWorkspace(workspaceId)) stillUnread.add(sessionId);
+            }
+            for (const sessionId of unreadSessionSet) {
+              if (!stillUnread.has(sessionId)) unreadSessionSet.delete(sessionId);
+            }
+          }
           hostParents = data.parents && typeof data.parents === 'object' ? data.parents : Object.create(null);
           workspaceOfSession = data.owners && typeof data.owners === 'object' ? data.owners : Object.create(null);
           hostProtocol = Number(data.protocolVersion) || 0;
@@ -1207,10 +1272,16 @@ window.__ModuleLoader__.load({
           refresh();
         }
       } catch (e) {
-        // Silent catch for background polling
+        if (!disposed) setHostError(e.status === 401 || e.status === 403 ? 'noteHostAuth' : 'noteHostUnavailable');
       } finally {
         isFetching = false;
       }
+    }
+
+    function setHostError(messageKey) {
+      if (hostError === messageKey) return;
+      hostError = messageKey;
+      if (settingsStore) settingsStore.set({ settings, hostAccepted, hostError });
     }
 
     function togglePin(workspaceId, btnElement) {
@@ -1905,7 +1976,7 @@ window.__ModuleLoader__.load({
       try {
         window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
       } catch {}
-      if (settingsStore) settingsStore.set({ settings, hostAccepted });
+      if (settingsStore) settingsStore.set({ settings, hostAccepted, hostError });
       renderDshEnhancements();
     }
 
@@ -1917,7 +1988,7 @@ window.__ModuleLoader__.load({
       try {
         window.localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
       } catch {}
-      if (settingsStore) settingsStore.set({ settings, hostAccepted });
+      if (settingsStore) settingsStore.set({ settings, hostAccepted, hostError });
       renderDshEnhancements();
     }
 
@@ -2008,9 +2079,9 @@ window.__ModuleLoader__.load({
           })
         }) : null,
         jsxRuntime.jsx('p', {
-          className: snapshot.hostAccepted ? 'dsh-order-panel-note' : 'dsh-order-panel-error',
-          role: snapshot.hostAccepted ? void 0 : 'status',
-          children: t(snapshot.hostAccepted ? 'note' : 'notePendingHost')
+          className: snapshot.hostAccepted && !snapshot.hostError ? 'dsh-order-panel-note' : 'dsh-order-panel-error',
+          role: snapshot.hostAccepted && !snapshot.hostError ? void 0 : 'status',
+          children: t(snapshot.hostError || (snapshot.hostAccepted ? 'note' : 'notePendingHost'))
         })
       ] });
     }
@@ -2047,7 +2118,9 @@ window.__ModuleLoader__.load({
         'hint.badgeError': '里面有会话异常中断时显示，会话行自己的圆点也一起变红；点开该会话后都消失。',
         'hint.badgeRunningDone': '干活时显示旋转圈，跑完且你还没看时显示绿色对勾；在你眼前跑完的不算没看。',
         note: '开关即时生效，无需刷新页面。',
-        notePendingHost: '部分更改尚未保存到主机，恢复连接后会自动重试；若刚更新插件，请重启 Harness 以加载主机修复。'
+        notePendingHost: '设置尚未与主机确认，恢复连接后会自动重试。',
+        noteHostAuth: '主机拒绝了状态请求，请检查 DSH 登录或访问地址；恢复后会自动重试。',
+        noteHostUnavailable: '暂时无法读取主机状态，正在自动重试。'
       },
       en: {
         title: 'Session Focus Enhancer',
@@ -2071,7 +2144,9 @@ window.__ModuleLoader__.load({
         'hint.badgeError': 'Shows after a session fails, and turns that session row\'s own dot red; both clear when you open it.',
         'hint.badgeRunningDone': 'Spins while working, turns into a green check when finished unread; a turn you watched finish does not count as unread.',
         note: 'Changes apply immediately; no reload needed.',
-        notePendingHost: 'Some changes are not saved to the Host yet and will retry after reconnecting. After a plugin update, restart Harness to load the Host fixes.'
+        notePendingHost: 'Settings are not confirmed by the Host yet and will retry after reconnecting.',
+        noteHostAuth: 'The Host rejected the status request. Check your DSH login and address; requests retry automatically.',
+        noteHostUnavailable: 'Host status is temporarily unavailable. Retrying automatically.'
       }
     };
 

@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { readFile, rename, mkdir, open } from 'node:fs/promises';
 
 export const name = 'workspace-order';
-export const inject = ['workspaceRegistry', 'webServer', 'agents'];
+export const inject = ['workspaceRegistry', 'webServer', 'agents', 'connection'];
 
 const STATUS_PATH = '/api/workspace-order/status';
 const TOGGLE_PIN_PATH = '/api/workspace-order/toggle-pin';
@@ -77,77 +77,6 @@ function jsonResponse(res, status, data) {
     'cache-control': 'no-cache, no-store'
   });
   res.end(body);
-}
-
-/**
- * Parse a `Host`-header authority the way the Host's own fence does (WHATWG
- * URL over `http://`, so default ports are stripped and IPv6 must be
- * bracketed).
- */
-function parseAuthority(authority) {
-  try {
-    return new URL(`http://${authority}`);
-  } catch {
-    return void 0;
-  }
-}
-
-/**
- * Official loopback-hostname semantics (mirrors
- * `isLoopbackHostname` in @deepseek-ai/dsh-client-connection): `localhost`,
- * `[::1]`, and the whole 127.0.0.0/8 written as four dotted octets.
- */
-function isLoopbackHostname(hostname) {
-  if (hostname === 'localhost' || hostname === '[::1]') return true;
-  const parts = hostname.split('.');
-  return parts.length === 4 && parts[0] === '127' && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
-}
-
-/**
- * Socket-level loopback check, kept as a second layer: a request can carry a
- * spoofable `Host` header, but the peer address cannot be forged over TCP.
- */
-function isLoopbackSocket(req) {
-  const remote = (req.socket?.remoteAddress || '').toLowerCase();
-  return remote === '::1' || remote === '127.0.0.1' || remote === '::ffff:127.0.0.1';
-}
-
-/**
- * Confused-deputy fence for every plugin route. The official `/api` bridge
- * never sees these paths (exact routes win over its prefix), so this plugin
- * owns its own admission and mirrors the official fence's three decisions
- * (`isTrustedApiRequest`): the Host header must name our own loopback server
- * (defeats DNS rebinding), `Sec-Fetch-Site` must not be `cross-site`, and any
- * `Origin` the browser does attach must be the same authority.
- * @returns true when the request may proceed.
- */
-function isTrustedRequest(req) {
-  if (!isLoopbackSocket(req)) return false;
-  const host = req.headers?.host;
-  if (typeof host !== 'string' || host.trim() === '') return false;
-  const hostUrl = parseAuthority(host);
-  if (hostUrl === void 0) return false;
-  // Canonical-form guard, before anything else: WHATWG parsing rewrites
-  // aliases like `0x7f.0.0.1` or `127.1` into `127.0.0.1`, so an attacker could
-  // smuggle a rebound authority past a "loopback" test that only sees the
-  // parsed form. Only a spelling whose hostname part survives round-tripping
-  // unchanged is accepted (case aside, brackets preserved for IPv6).
-  const spelledHostname = hostUrl.port === ''
-    ? host.trim().toLowerCase()
-    : host.slice(0, host.length - String(hostUrl.port).length - 1).trim().toLowerCase();
-  if (hostUrl.hostname !== spelledHostname) return false;
-  if (!isLoopbackHostname(hostUrl.hostname)) return false;
-  const site = req.headers?.['sec-fetch-site'];
-  if (typeof site === 'string' && site.toLowerCase() === 'cross-site') return false;
-  const origin = req.headers?.origin;
-  if (typeof origin === 'string' && origin.trim() !== '') {
-    try {
-      if (new URL(origin).host !== hostUrl.host) return false;
-    } catch {
-      return false;
-    }
-  }
-  return true;
 }
 
 /**
@@ -235,14 +164,22 @@ export function apply(ctx) {
     return ctx.webServer.register({
       ...route,
       handler: async (req, res) => {
-        if (!isTrustedRequest(req)) return jsonResponse(res, 403, { error: 'Forbidden' });
         pendingResponses.add(res);
         try {
+          // The native service owns login, trusted authorities and Origin checks.
+          // Success is undefined: never run a second, loopback-only fence after it.
+          // Keep the original request, including socket facts used by the Host.
+          const rejection = ctx.connection.requestRejection(req);
+          if (rejection !== undefined) {
+            req.resume();
+            return jsonResponse(res, rejection, { error: rejection === 401 ? 'Unauthorized' : 'Forbidden' });
+          }
           await ready;
           ensureActive();
           await route.handler(req, res);
         } catch (error) {
-          jsonResponse(res, error.status || 500, { error: String(error) });
+          req.resume();
+          jsonResponse(res, error.status || 500, { error: 'Workspace service unavailable' });
         } finally {
           pendingResponses.delete(res);
         }
@@ -746,6 +683,10 @@ export function apply(ctx) {
     kind: 'exact',
     path: STATUS_PATH,
     handler: async (req, res) => {
+      if (req.method !== 'GET') {
+        req.resume();
+        return jsonResponse(res, 405, { error: 'Method Not Allowed' });
+      }
       try {
         await ready;
         jsonResponse(res, 200, statusPayload());
