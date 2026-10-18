@@ -1,6 +1,6 @@
 // Starts the actual installed DSH with a private temporary home and synthetic data.
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, realpath } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -22,7 +22,7 @@ export function request(port, path, { host = 'dsh.focus.test', cookie, body, raw
   });
 }
 export async function startNativeHost() {
-  const root=await mkdtemp(join(tmpdir(),'dsh-focus-native-'));
+  const root=await realpath(await mkdtemp(join(tmpdir(),'dsh-focus-native-')));
   const home=join(root,'home'),profile=join(home,'profiles/focus-test');await mkdir(profile,{recursive:true,mode:0o700});
   const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>!/^DSH_|TOKEN|PASSWORD|SECRET|KEY/i.test(k)));
   Object.assign(env,{DSH_HOME:home,CI:'true'});
@@ -39,7 +39,7 @@ export async function startNativeHost() {
     await writeFile(fixture,`export const name='focus-fixture';export const inject=['webServer','connection','workspaceRegistry','sessions'];export async function apply(ctx){
       const a=await ctx.workspaceRegistry.create(${JSON.stringify(root)},'Focus QA Parent');
       const b=await ctx.workspaceRegistry.create(${JSON.stringify(profile)},'Focus QA Child');
-      const id='session-focus-qa';const session=ctx.sessions.get(id)||ctx.sessions.create(id,{meta:{cwd:${JSON.stringify(profile)}}});session.append('user/message',{role:'user',content:[{type:'text',text:'Synthetic sidebar fixture; no agent is started.'}]},{surfaceOp:'append'});session.append('session/title',{title:'Focus QA Session',messageSeqs:[],source:{kind:'user'}});await b.attachSession(id);
+      const id='session-focus-qa';const session=ctx.sessions.get(id)||ctx.sessions.create(id,{meta:{cwd:${JSON.stringify(profile)}}});session.append('turn/start',{turn:1});session.append('user/message',{role:'user',source:{kind:'user'},content:[{type:'text',text:'Synthetic sidebar fixture; no agent is started.'}]},{surfaceOp:'append'});session.append('turn/end',{turn:1,reason:{kind:'completed'}});session.append('session/title',{title:'Focus QA Session',messageSeqs:[],source:{kind:'user'}});await b.attachSession(id);
       ctx.effect(()=>ctx.webServer.register({kind:'exact',path:'/api/focus-fixture',handler(req,res){const denial=ctx.connection.requestRejection(req);if(denial){res.writeHead(denial);res.end();return;}res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({parent:a.id,child:b.id,session:id}));}}));
     }`);
     await writeFile(join(profile,'cordis.patch.yml'),`- id: connection\n  config:\n    trustedHosts: !!js "['dsh.focus.test', ...ctx.webStartup.trustedHosts]"\n- insert:\n    - id: focus-fixture\n      name: ${pathToFileURL(fixture).href}\n`);
