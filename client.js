@@ -616,6 +616,41 @@ window.__ModuleLoader__.load({
         border-radius: var(--dsw-radius-lg, 16px);
       }
 
+      /*
+       * A nested workspace steps its whole block right, one step per level, so
+       * a level's shaded tray starts under that level's own folder icon instead
+       * of every level sharing one left edge. The step is the page's own indent
+       * unit (12px), the same one the folder and the title use, so the box and
+       * the content inside it always begin on the same column.
+       *
+       * Nesting is read from the page's own group class rather than from a class
+       * this plugin adds: a collapsed child draws no tray of its own, but it is
+       * still laid out inside the shifted parent and has to move with it.
+       *
+       * The right edge is deliberately left alone. Pulling it in as well would
+       * narrow the box from both sides and cost every deeper level the room its
+       * long workspace names need.
+       */
+      div[class*="groupSection"] div[class*="groupSection"] {
+        margin-left: 12px;
+      }
+
+      /*
+       * The step is taken by the box, so the rows give their own indent back.
+       * A row that kept its full indent inside a shifted box would sit one step
+       * too far right, and the folder, title, pin and badge would all drift.
+       * With the indent returned, a row lands exactly where it did before the
+       * box moved. The "show more" button is excluded here and realigned below,
+       * since its own padding carries the same indent.
+       */
+      div[class*="groupSection"] div[class*="groupSection"] > [data-row-key]:not([data-row-key^="overflow:"]) {
+        padding-inline-start: 8px !important;
+      }
+
+      div[class*="groupSection"] div[class*="groupSection"] > [class*="sessionOverflowButton"] {
+        padding-left: 28px !important;
+      }
+
       .dsh-order-panel-note { font-size: 12px; color: var(--dsw-alias-label-tertiary, rgba(255, 255, 255, 0.45)); padding-top: 8px; }
       .dsh-order-panel-error { font-size: 12px; color: var(--dsh-order-red); padding-top: 8px; }
 
