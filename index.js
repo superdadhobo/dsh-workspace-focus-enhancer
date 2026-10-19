@@ -50,7 +50,9 @@ const DEFAULT_SETTINGS = Object.freeze({
   /** Expanding one workspace collapses the others (browser-side behaviour). */
   autoCollapse: true,
   /** Outlines the workspace holding the session on screen (browser-side). */
-  highlightCurrent: true
+  highlightCurrent: true,
+  /** Show own sessions above sub-workspaces in tree view (browser-side). */
+  treeSessionsFirst: true
 });
 
 /**

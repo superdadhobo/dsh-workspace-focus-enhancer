@@ -1,6 +1,6 @@
 {
   "name": "dsh-workspace-focus-enhancer",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "dsh工作区专注增强：图钉置顶、有会话运行时自动前移、点开一个工作区自动折叠其他、当前工作区高亮、会话状态徽标（橙问号=等你回答、红感叹号=异常中断、旋转圈=进行中、绿勾=完成未读）、会话收藏（星标可上浮到工作区并显示数量）。Workspace focus enhancements for the DeepSeek Harness web UI: pin & auto-order workspaces, auto-collapse, current highlight, session status badges, and session favorites.",
   "license": "MIT",
   "author": "superdadhobo",

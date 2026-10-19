@@ -557,7 +557,9 @@ window.__ModuleLoader__.load({
       /** Expanding one workspace collapses the sibling groups. */
       autoCollapse: true,
       /** Outlines the workspace holding the session on screen. */
-      highlightCurrent: true
+      highlightCurrent: true,
+      /** Show own sessions above nested sub-workspaces in tree view. */
+      treeSessionsFirst: true
     };
     const SETTINGS_STORAGE_KEY = 'dsh-workspace-focus-enhancer:settings';
     const SETTINGS_PENDING_KEY = SETTINGS_STORAGE_KEY + ':pending';
@@ -619,6 +621,7 @@ window.__ModuleLoader__.load({
       { key: 'pinTop', labelKey: 'row.pinTop', hintKey: 'hint.pinTop' },
       { key: 'autoFront', labelKey: 'row.autoFront', hintKey: 'hint.autoFront' },
       { key: 'autoCollapse', labelKey: 'row.autoCollapse', hintKey: 'hint.autoCollapse' },
+      { key: 'treeSessionsFirst', labelKey: 'row.treeSessionsFirst', hintKey: 'hint.treeSessionsFirst' },
       { key: 'highlightCurrent', labelKey: 'row.highlightCurrent', hintKey: 'hint.highlightCurrent' },
       { key: 'badgeWaiting', labelKey: 'row.badgeWaiting', hintKey: 'hint.badgeWaiting' },
       { key: 'badgeError', labelKey: 'row.badgeError', hintKey: 'hint.badgeError' },
@@ -652,13 +655,92 @@ window.__ModuleLoader__.load({
       /*
        * An expanded workspace reads as a recessed tray: its header row and the
        * sessions it reveals share one sunken surface, so the open group stands
-       * apart from the collapsed ones at a glance. The fill is translucent, so
-       * it darkens on dark themes and grays on light ones without a second rule.
+       * apart from the collapsed ones at a glance.
+       *
+       * Level 1 (top-level expanded workspace): delicate, translucent tint with a subtle frame.
+       * Level 2+ (nested expanded sub-workspaces): micro-stepped tint with a crisp inner frame
+       * so it reads as "a smaller tray inside a bigger tray" without stacking into blackness.
        */
       .dsh-order-open-group {
-        background: var(--dsw-alias-bg-mask-2, rgba(0, 0, 0, 0.12));
-        box-shadow: inset 0 1px 2px var(--dsw-alias-bg-mask-2, rgba(0, 0, 0, 0.12));
+        background: rgba(0, 0, 0, 0.045);
+        box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.05), inset 0 1px 2px rgba(0, 0, 0, 0.03);
         border-radius: var(--dsw-radius-lg, 16px);
+      }
+
+      div[class*="groupSection"] div[class*="groupSection"].dsh-order-open-group {
+        background: rgba(0, 0, 0, 0.04);
+        box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.07), inset 0 1px 2px rgba(0, 0, 0, 0.04);
+      }
+
+      div[class*="groupSection"] div[class*="groupSection"] div[class*="groupSection"].dsh-order-open-group {
+        background: rgba(0, 0, 0, 0.025);
+        box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08), inset 0 1px 2px rgba(0, 0, 0, 0.04);
+      }
+
+      body[data-ds-dark-theme] .dsh-order-open-group {
+        background: rgba(255, 255, 255, 0.05);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+      }
+
+      body[data-ds-dark-theme] div[class*="groupSection"] div[class*="groupSection"].dsh-order-open-group {
+        background: rgba(255, 255, 255, 0.04);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.09);
+      }
+
+      body[data-ds-dark-theme] div[class*="groupSection"] div[class*="groupSection"] div[class*="groupSection"].dsh-order-open-group {
+        background: rgba(255, 255, 255, 0.03);
+        box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.11);
+      }
+
+      /*
+       * Enhance folder icon contrast in workspace rows.
+       * The native app styles the folder slot with label-tertiary (~40% opacity),
+       * which easily washes out against shaded tray backgrounds. Lifting to label-secondary
+       * gives folders crisp outlines so sub-workspaces and sessions are never confused.
+       */
+      div[data-row-key^="workspace:"] span[class*="folder"]:not([class*="folderActive"]) {
+        color: var(--dsw-alias-label-secondary, rgba(0, 0, 0, 0.65));
+        opacity: 0.88;
+      }
+      body[data-ds-dark-theme] div[data-row-key^="workspace:"] span[class*="folder"]:not([class*="folderActive"]) {
+        color: var(--dsw-alias-label-secondary, rgba(255, 255, 255, 0.72));
+        opacity: 0.88;
+      }
+
+      /*
+       * Tree view ordering: own sessions first, sub-workspaces below.
+       *
+       * Under tree view (groupBy === 'workspace-tree') the page lists a
+       * workspace's nested sub-workspaces ABOVE its own sessions, so the
+       * sessions end up pressed against the last child workspace and read as
+       * if they belonged to it.
+       *
+       * The whole fix is one move: the child-workspace block is pushed to the
+       * end of its parent, and everything else is left exactly where the page
+       * put it. That is deliberate. The page wraps each row in its own span, so
+       * matching "rows" directly would mean depending on an internal wrapper
+       * tag that has already changed once and can change again; this rule only
+       * names the one element that carries a meaning the page commits to — the
+       * role="group" block holding the nested workspaces. With that block
+       * moved last, the workspace header, its own sessions and its "show more"
+       * button all keep their native order, which is already header → sessions
+       * → overflow.
+       *
+       * The wrapper span around every row is deliberately NOT used as an anchor:
+       * it is an internal implementation detail that already changed once.
+       *
+       * Flex reordering leaves the DOM alone, so React reconciliation, the
+       * page's drag-and-drop, keyboard focus and selection are untouched: only
+       * the painted order changes.
+       */
+      body.dsh-order-sessions-first div[class*="groupSection"] {
+        display: flex;
+        flex-direction: column;
+      }
+
+      body.dsh-order-sessions-first div[class*="groupSection"] > [role="group"] {
+        order: 1;
+        margin-top: 4px;
       }
 
       /*
@@ -2085,8 +2167,14 @@ window.__ModuleLoader__.load({
       return false;
     }
 
+    function syncTreeOrderMode() {
+      const active = usesWorkspaceTree() && settings.treeSessionsFirst !== false;
+      document.body.classList.toggle('dsh-order-sessions-first', active);
+    }
+
     function renderDshEnhancements() {
       if (disposed) return;
+      syncTreeOrderMode();
       const rows = document.querySelectorAll('div[data-row-key^="workspace:"]');
       const liveStates = computeLiveStates();
       const states = effectiveStates(liveStates);
@@ -2387,12 +2475,14 @@ window.__ModuleLoader__.load({
         'row.pinTop': '工作区置顶',
         'row.autoFront': '工作区自动排序',
         'row.autoCollapse': '无关工作区自动折叠',
+        'row.treeSessionsFirst': '树形下直属会话排在上方',
         'row.badgeWaiting': '橙色问号',
         'row.badgeError': '红色感叹号',
         'row.badgeRunningDone': '旋转圈与绿色对勾',
         'hint.pinTop': '悬停显示图钉，钉住的工作区永远排最前；关闭后已钉名单仍保留。',
         'hint.autoFront': '有会话开始干活时，该工作区自动移到列表前面。',
         'hint.autoCollapse': '点开一个工作区时，其他展开着的工作区自动收起；它的上级和子级不受影响。',
+        'hint.treeSessionsFirst': '按树结构分组时，工作区自身的会话优先排在子工作区前面，避免被误认成最底下一个子工作区内的会话。',
         'row.highlightCurrent': '高亮当前工作区',
         'hint.highlightCurrent': '把正在看的那个会话所属的工作区，连同它展开的会话一起框一圈边框，一眼定位。',
         'hint.badgeWaiting': '里面有会话等你回答、等批准或等计划确认时显示。',
@@ -2413,12 +2503,14 @@ window.__ModuleLoader__.load({
         'row.pinTop': 'Pin workspace to top',
         'row.autoFront': 'Auto-sort workspaces',
         'row.autoCollapse': 'Auto-collapse unrelated workspaces',
+        'row.treeSessionsFirst': 'Own sessions first in tree',
         'row.badgeWaiting': 'Orange question mark',
         'row.badgeError': 'Red exclamation mark',
         'row.badgeRunningDone': 'Spinner and green check',
         'hint.pinTop': 'Pinned workspaces always lead the list; turning this off keeps your pin list.',
         'hint.autoFront': 'A workspace with a running session moves to the front automatically.',
         'hint.autoCollapse': 'Opening a workspace collapses the other expanded ones; its parent and children stay put.',
+        'hint.treeSessionsFirst': 'In tree view, show the workspace\'s own sessions above its nested sub-workspaces to avoid visual confusion.',
         'row.highlightCurrent': 'Highlight the current workspace',
         'hint.highlightCurrent': 'Outlines the workspace of the session you are looking at, together with its expanded sessions, so you can find it at a glance.',
         'hint.badgeWaiting': 'Shows while a session waits for your answer, approval, or plan review.',
@@ -2671,6 +2763,7 @@ window.__ModuleLoader__.load({
       // These marks live on the page's own containers: unmark, never remove.
       document.querySelectorAll('.dsh-order-current-group').forEach(el => el.classList.remove('dsh-order-current-group'));
       document.querySelectorAll('.dsh-order-open-group').forEach(el => el.classList.remove('dsh-order-open-group'));
+      document.body.classList.remove('dsh-order-sessions-first');
       // 1. Inject stylesheets: badges first, then the control panel's own rows.
       const styleEl = document.createElement('style');
       styleEl.textContent = CSS + PANEL_CSS;
@@ -2740,6 +2833,7 @@ window.__ModuleLoader__.load({
           closeStarMenu();
           document.querySelectorAll('.dsh-order-current-group').forEach(el => el.classList.remove('dsh-order-current-group'));
           document.querySelectorAll('.dsh-order-open-group').forEach(el => el.classList.remove('dsh-order-open-group'));
+          document.body.classList.remove('dsh-order-sessions-first');
         });
       }
     }

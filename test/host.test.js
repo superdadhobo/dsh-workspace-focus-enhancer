@@ -78,7 +78,7 @@ test('native authentication errors fail closed and do not leak error details', a
 
 test('settings, explicit pin and favorite writes persist, survive reload and remain idempotent', async t => {
   const h = await harness(t);
-  const settings = { autoFront:false,pinTop:true,badgeWaiting:false,badgeError:true,badgeRunningDone:false,autoCollapse:false,highlightCurrent:true };
+  const settings = { autoFront:false,pinTop:true,badgeWaiting:false,badgeError:true,badgeRunningDone:false,autoCollapse:false,highlightCurrent:true,treeSessionsFirst:false };
   assert.equal((await h.call('settings',{method:'POST',body:{settings}})).status,200);
   for(let i=0;i<2;i++) {
     assert.equal((await h.call('toggle-pin',{method:'POST',body:{workspaceId:'child',pinned:true}})).status,200);
