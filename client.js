@@ -503,6 +503,104 @@ window.__ModuleLoader__.load({
       .dsh-order-session-mark[data-mark="done"] {
         color: var(--dsh-order-green);
       }
+
+      /*
+       * The three state glyphs, as masks.
+       *
+       * A mask is the one way to change a session mark's silhouette without
+       * taking the colour away from the rules that already own it: the mark
+       * keeps painting its own currentColor, and the mask only decides which
+       * pixels survive. So the palette below, the unread lift, the failure
+       * override and the foreign "read elsewhere" retirement all go on working
+       * untouched — what changes is the shape alone.
+       *
+       * Each drawing is the workspace badge's own path, so a session and the
+       * workspace above it show literally the same glyph rather than two
+       * near-misses. Strokes are thickened relative to the badge because this
+       * one renders at 10px instead of 14px; the badge's own 2.2 and 2.6 would
+       * thin out to a hairline at that size.
+       */
+      body {
+        --dsh-order-glyph-waiting: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='none' stroke='%23000' stroke-width='3.1' stroke-linecap='round' d='M9.2 9.1a2.9 2.9 0 1 1 3.7 3.2c-.8.2-1.4 1-1.4 1.9v.5'/><circle cx='11.6' cy='18.4' r='2.3' fill='%23000'/></svg>");
+        --dsh-order-glyph-error: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='9.9' y='3.4' width='4.2' height='11.4' rx='2.1' fill='%23000'/><circle cx='12' cy='18.9' r='2.4' fill='%23000'/></svg>");
+        --dsh-order-glyph-done: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><polyline points='4.2 12.6 9.4 17.8 19.8 6.2' fill='none' stroke='%23000' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+      }
+
+      /*
+       * One vocabulary, two places.
+       *
+       * The page paints a session's state as a filled circle — a single
+       * ::after at 60% inset — so a row could only ever say "something green" or
+       * "something amber"; the shape that tells waiting from failed from
+       * finished lived only on the workspace row, one column over, and the two
+       * columns disagreed about what a finished session even looks like. Every
+       * meaningful state now carries the same glyph the workspace badge carries,
+       * so reading down a group reads one language:
+       *
+       *   orange ?  waiting for you    red !  broke     green ✓  finished
+       *   green spinner  working       faint dot  idle
+       *
+       * Idle is left as the page's own faint dot: a workspace shows nothing at
+       * all when idle, and a row that vanished entirely would lose the leading
+       * rhythm the whole list is built on.
+       *
+       * The selectors name every path a mark can arrive by — the page's own
+       * dot, the plugin's fallback mark, an unread dot lifted by the shared
+       * ledger, and a dot the failure rule took over — because a mark that
+       * changed shape only on some of those paths would be worse than none.
+       */
+      div[data-row-key^="session:"] [data-state="warning"]::after,
+      div[data-row-key^="session:"] [data-state="error"]::after,
+      div[data-row-key^="session:"] [data-state="done"]::after,
+      div[data-row-key^="session:"] [data-state="ongoing"]::after,
+      div[data-row-key^="session:"].dsh-order-session-unread [data-state="idle"]::after,
+      div[data-row-key^="session:"].dsh-order-session-errored [data-state="done"]::after,
+      div[data-row-key^="session:"].dsh-order-session-errored [data-state="idle"]::after,
+      .dsh-order-session-mark::after {
+        inset: 0;
+        border-radius: 0;
+        background: currentColor;
+        -webkit-mask-repeat: no-repeat;
+        mask-repeat: no-repeat;
+        -webkit-mask-position: center;
+        mask-position: center;
+        -webkit-mask-size: contain;
+        mask-size: contain;
+      }
+
+      div[data-row-key^="session:"] [data-state="warning"]::after,
+      .dsh-order-session-mark[data-mark="waiting"]::after {
+        -webkit-mask-image: var(--dsh-order-glyph-waiting);
+        mask-image: var(--dsh-order-glyph-waiting);
+      }
+
+      div[data-row-key^="session:"] [data-state="error"]::after,
+      div[data-row-key^="session:"].dsh-order-session-errored [data-state="done"]::after,
+      div[data-row-key^="session:"].dsh-order-session-errored [data-state="idle"]::after,
+      .dsh-order-session-mark[data-mark="error"]::after {
+        -webkit-mask-image: var(--dsh-order-glyph-error);
+        mask-image: var(--dsh-order-glyph-error);
+      }
+
+      div[data-row-key^="session:"] [data-state="done"]::after,
+      div[data-row-key^="session:"].dsh-order-session-unread [data-state="idle"]::after,
+      .dsh-order-session-mark[data-mark="done"]::after {
+        -webkit-mask-image: var(--dsh-order-glyph-done);
+        mask-image: var(--dsh-order-glyph-done);
+      }
+
+      /*
+       * Working: the page draws that spinner in the same neutral grey it gives
+       * every inert glyph, which reads as "nothing is happening" on a row that
+       * is in fact the only one doing anything. The workspace badge above it
+       * already spins in the running green; this points the row's spinner at the
+       * very same token, so one turn in progress is one colour from the header
+       * down. Only the colour moves — the page keeps its geometry, its dash
+       * animation and its reduced-motion fallback.
+       */
+      div[data-row-key^="session:"] [data-state="ongoing"] {
+        color: var(--dsh-order-green);
+      }
     `;
 
     // Pin icon SVG
