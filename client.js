@@ -436,6 +436,25 @@ window.__ModuleLoader__.load({
       }
 
       /*
+       * The Host's shared ledger drives the row dot in both directions, because
+       * the page's own store only knows what this page watched with its own
+       * eyes. A reply the ledger still calls unread lifts a plain idle dot to
+       * the same green on a client that never saw the turn end — without it, a
+       * second browser shows the workspace check but no dot on the session
+       * itself. The mirror case: this page watched the turn end and its store
+       * keeps the dot green until the session is opened *here*, even after the
+       * reply was read on another client; a retirement from the ledger returns
+       * that dot to idle. The failure rule below still outranks both.
+       */
+      .dsh-order-session-unread [data-state="idle"] {
+        color: var(--dsh-order-green) !important;
+      }
+
+      .dsh-order-session-read [data-state="done"] {
+        color: var(--dsw-alias-state-idle-primary, #94a3b8) !important;
+      }
+
+      /*
        * A session row whose turn failed: the page's own status store has no idea
        * a turn can fail, so it paints the stop as a plain completion — a green
        * dot on a conversation that actually broke. The dot is recoloured here so
@@ -722,6 +741,59 @@ window.__ModuleLoader__.load({
     let workspaceOfSession = Object.create(null);
     /** Session ids whose failure this page witnessed, cleared once the user opens them. */
     const clientErrored = new Set();
+
+    /**
+     * When this page's own store first claimed "finished unread" for a session:
+     * sessionId -> timestamp. The local store is per-browser: it only ever saw
+     * the turns that ended in front of this page, and nothing can retract an
+     * entry from another client. Pairing the timestamp with the Host's poll
+     * clock is what makes retraction possible anyway — a Host reply that
+     * arrived *after* the local sighting and still does not list the session
+     * as unread means the reply was read somewhere else, and the local green
+     * must go. Without a poll newer than the sighting, the local store stays
+     * trusted, so a completion can never blink out during a Host outage or in
+     * the gap before the next poll.
+     */
+    const localUnreadSeenAt = new Map();
+
+    /** Wall clock of the last successful Host status poll; 0 before the first. */
+    let lastStatusAt = 0;
+
+    /** How long a poll stays fresh enough to outrank the local store. */
+    const HOST_FRESH_MS = 10000;
+
+    /** Whether the Host ledger answered recently enough to arbitrate. */
+    function hostFresh() {
+      return lastStatusAt > 0 && Date.now() - lastStatusAt < HOST_FRESH_MS;
+    }
+
+    /**
+     * Whether this page's own "finished unread" claim still counts, or the
+     * Host's shared ledger has since retired it (the reply was opened on
+     * another client). Called from the render path, so the sighting clock is
+     * maintained here for every session the live store reports.
+     */
+    function localDoneCounts(sessionId) {
+      const seenAt = localUnreadSeenAt.get(sessionId);
+      if (unreadSessionSet.has(sessionId)) {
+        // The ledger agrees the reply is unread; start the comparison clock
+        // from the agreement, so its retirement can take effect on the very
+        // next poll instead of one poll after that.
+        if (seenAt === undefined) localUnreadSeenAt.set(sessionId, Date.now());
+        return true;
+      }
+      // A sighting this page has not recorded yet cannot be compared against
+      // the poll clock; trust the local store and start the clock now.
+      if (seenAt === undefined) {
+        localUnreadSeenAt.set(sessionId, Date.now());
+        return true;
+      }
+      // Only a Host that actually enumerated its per-session marks may retire
+      // a local sighting; a Host that predates the list says nothing about it.
+      if (sessionMarksKnown !== true) return true;
+      if (!hostFresh() || lastStatusAt < seenAt) return true;
+      return false;
+    }
 
     const FAVORITES_STORAGE_KEY = 'dsh-workspace-focus-enhancer:favorites';
 
@@ -1053,8 +1125,18 @@ window.__ModuleLoader__.load({
         if (!status) continue;
         const pending = status.pendingInteraction;
         if (pending && VISIBLE_PENDING.has(pending.kind)) waiting = true;
-        if (status.running === true) running = true;
-        else if (status.completionUnread === true) done = true;
+        if (status.running === true) {
+          running = true;
+          localUnreadSeenAt.delete(id);
+        } else if (status.completionUnread === true) {
+          // The page's own store is per-browser and cannot be retracted by
+          // another client; the Host's shared ledger can, and once its answer
+          // is newer than this page's sighting it wins — that is what makes
+          // "read on the phone" clear the desktop's green too.
+          if (localDoneCounts(id)) done = true;
+        } else {
+          localUnreadSeenAt.delete(id);
+        }
       }
       // Unseen failure outranks live activity: it is what the user must act on.
       if (erroredSet.has(workspaceId)) errored = true;
@@ -1248,6 +1330,10 @@ window.__ModuleLoader__.load({
       const polledSettingsEpoch = settingsEpoch;
       const polledFavoritesEpoch = favoritesEpoch;
       const polledPinsEpoch = pinsEpoch;
+      // Stamp when the question was asked, not when the answer landed: a turn
+      // can end in flight, and the stale reply must not count as a newer
+      // ledger that retires the green the ending just raised.
+      const requestedAt = Date.now();
       try {
         const res = await fetch('/api/workspace-order/status');
         if (!res.ok) throw Object.assign(new Error('Status request failed'), { status: res.status });
@@ -1255,6 +1341,7 @@ window.__ModuleLoader__.load({
           const data = await res.json();
           if (disposed || pendingPins.size || polledPinsEpoch !== pinsEpoch) return;
           setHostError('');
+          lastStatusAt = requestedAt;
           pinnedSet = new Set(data.pinned || []);
           fallbackBusy = new Set(data.busy || []);
           erroredSet = new Set(data.errored || []);
@@ -1294,6 +1381,13 @@ window.__ModuleLoader__.load({
           }
           hostParents = data.parents && typeof data.parents === 'object' ? data.parents : Object.create(null);
           workspaceOfSession = data.owners && typeof data.owners === 'object' ? data.owners : Object.create(null);
+          // Sessions come and go; a sighting for one the Host no longer owns
+          // would otherwise keep its clock running forever.
+          if (localUnreadSeenAt.size) {
+            for (const sessionId of localUnreadSeenAt.keys()) {
+              if (!Object.hasOwn(workspaceOfSession, sessionId)) localUnreadSeenAt.delete(sessionId);
+            }
+          }
           hostProtocol = Number(data.protocolVersion) || 0;
           if (Array.isArray(data.favorites) && polledFavoritesEpoch === favoritesEpoch && !favoritesSync) {
             applyFavorites(overlayFavorites(data.favorites));
@@ -1646,6 +1740,46 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Reconcile one session row's dot with the Host's shared unread ledger, in
+     * both directions.
+     *
+     * Up: the page's own store only knows a completion this page watched end,
+     * so a reply that finished while nobody was looking here — on the desktop
+     * while this is the phone, say — leaves the row a plain idle dot even
+     * though the workspace above it already wears the green check. The ledger
+     * knows better, and the row is lifted to match.
+     *
+     * Down: the page's store keeps its green until the session is opened on
+     * *this* page, and no other client can retract it; the ledger can. Once a
+     * poll newer than this page's own sighting has come back without the
+     * session, the reply was read somewhere else and the green is stale.
+     *
+     * The session on screen is left alone in both directions — opening it is
+     * exactly what "read" means — and a visible failure outranks both, since
+     * the errored rule paints its own colour over the done state.
+     */
+    function paintSessionUnread(row, sessionId) {
+      const onScreen = row.getAttribute('aria-selected') === 'true';
+      const spinning = row.querySelector('[data-state="ongoing"]') !== null;
+      const allowed = settings.badgeRunningDone && !onScreen && !spinning;
+      // The Host's per-session list is the only cross-client source; without
+      // it (old Host, or no successful poll yet) neither correction applies.
+      const ledgerKnown = sessionMarksKnown === true && hostFresh();
+      const statuses = live ? live.status.getSnapshot() : null;
+      const localDone = statuses instanceof Map
+        && statuses.get(sessionId)?.completionUnread === true;
+      const hostUnread = ledgerKnown && unreadSessionSet.has(sessionId);
+      const retired = allowed && ledgerKnown && localDone && !localDoneCounts(sessionId);
+      const unreadWanted = allowed && hostUnread && !retired;
+      if (row.classList.contains('dsh-order-session-unread') !== unreadWanted) {
+        row.classList.toggle('dsh-order-session-unread', unreadWanted);
+      }
+      if (row.classList.contains('dsh-order-session-read') !== retired) {
+        row.classList.toggle('dsh-order-session-read', retired);
+      }
+    }
+
+    /**
      * Paint a workspace row's rolled-up star count, after its name and never in
      * place of the state badge, which keeps its own leading position.
      */
@@ -1934,11 +2068,13 @@ window.__ModuleLoader__.load({
 
       // 5. Every session on screen carries its own star, and a failed session
       //    wears the failure instead of the plain "finished" the page paints.
+      //    The unread ledger reconciles each row's dot across clients.
       for (const sessionRow of document.querySelectorAll('div[data-row-key^="session:"]')) {
         const key = sessionRow.getAttribute('data-row-key') || '';
         const sessionId = key.slice('session:'.length);
         if (!sessionId) continue;
         paintSessionStar(sessionRow, sessionId);
+        paintSessionUnread(sessionRow, sessionId);
         paintSessionFailure(sessionRow, sessionId);
       }
     }
@@ -2151,7 +2287,7 @@ window.__ModuleLoader__.load({
         'hint.highlightCurrent': '把正在看的那个会话所属的工作区，连同它展开的会话一起框一圈边框，一眼定位。',
         'hint.badgeWaiting': '里面有会话等你回答、等批准或等计划确认时显示。',
         'hint.badgeError': '里面有会话异常中断时显示，会话行自己的圆点也一起变红；点开该会话后都消失。',
-        'hint.badgeRunningDone': '干活时显示旋转圈，跑完且你还没看时显示绿色对勾；在你眼前跑完的不算没看。',
+        'hint.badgeRunningDone': '干活时显示旋转圈，跑完且你还没看时显示绿色对勾；在你眼前跑完的不算没看。完成与已读以主机的共享记录为准：另一端点开过，这一端的绿勾和绿点也会消失；本端没看到的完成，会话行圆点也会补上绿色。',
         note: '开关即时生效，无需刷新页面。',
         notePendingHost: '设置尚未与主机确认，恢复连接后会自动重试。',
         noteHostAuth: '主机拒绝了状态请求，请检查 DSH 登录或访问地址；恢复后会自动重试。',
@@ -2177,7 +2313,7 @@ window.__ModuleLoader__.load({
         'hint.highlightCurrent': 'Outlines the workspace of the session you are looking at, together with its expanded sessions, so you can find it at a glance.',
         'hint.badgeWaiting': 'Shows while a session waits for your answer, approval, or plan review.',
         'hint.badgeError': 'Shows after a session fails, and turns that session row\'s own dot red; both clear when you open it.',
-        'hint.badgeRunningDone': 'Spins while working, turns into a green check when finished unread; a turn you watched finish does not count as unread.',
+        'hint.badgeRunningDone': 'Spins while working, turns into a green check when finished unread; a turn you watched finish does not count as unread. The shared Host ledger decides finished and read: opening a session on one client clears the green on the others, and a completion this page never watched still greens that session\'s dot.',
         note: 'Changes apply immediately; no reload needed.',
         notePendingHost: 'Settings are not confirmed by the Host yet and will retry after reconnecting.',
         noteHostAuth: 'The Host rejected the status request. Check your DSH login and address; requests retry automatically.',
