@@ -467,6 +467,42 @@ window.__ModuleLoader__.load({
       .dsh-order-session-errored [data-state="idle"] {
         color: var(--dsh-order-red) !important;
       }
+
+      /*
+       * The dot the page leaves out. The page names a dot only for a state it
+       * can name — waiting, running, or a completion this page has not read —
+       * and hands the leading cell to a plugin slot for everything else. An
+       * idle row is exactly what an unseen failure looks like from here, and
+       * also what a reply finished on another client looks like before the
+       * ledger is consulted, so in both cases there was no dot to recolour:
+       * the workspace above wore the red exclamation while the row that caused
+       * it stayed blank. This draws that dot in the cell the page reserved for
+       * it, to the page's own metrics, and stands down whenever the page does
+       * paint one so no row ever carries two.
+       */
+      .dsh-order-session-mark {
+        position: relative;
+        display: inline-block;
+        flex: none;
+        width: 10px;
+        height: 10px;
+      }
+
+      .dsh-order-session-mark::after {
+        content: "";
+        position: absolute;
+        inset: 20%;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      .dsh-order-session-mark[data-mark="error"] {
+        color: var(--dsh-order-red);
+      }
+
+      .dsh-order-session-mark[data-mark="done"] {
+        color: var(--dsh-order-green);
+      }
     `;
 
     // Pin icon SVG
@@ -1716,6 +1752,28 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Where the page keeps a session row's state dot.
+     *
+     * The page renders one status dot per row, and only while it has a state it
+     * can name. For every other state it hands the same 16px leading cell to the
+     * `sidebar.session.row.leading` slot, which sits empty at `display: contents`
+     * when the user has no plugin filling it. Handing back the cell — not the row
+     * — is what lets an extra mark take the dot's place without shifting the
+     * title, and appending after the page's own child leaves the slot's contents
+     * under the page's control.
+     */
+    function sessionMarkCell(row) {
+      return row.querySelector('[data-slot="sidebar.session.row.leading"]')
+        || row.querySelector('span[class*="slot"]');
+    }
+
+    /** The page's own status dot on this row, or null while it paints none. */
+    function pageStatusDot(row) {
+      const cell = row.querySelector('span[class*="slot"]');
+      return cell ? cell.querySelector('[data-state]') : null;
+    }
+
+    /**
      * Mark one session row as failed, so its dot stops claiming the turn finished
      * cleanly. The page decides a session's dot from what it knows — running, or a
      * completion waiting to be read — and it has no notion of failure, so a turn
@@ -1727,13 +1785,17 @@ window.__ModuleLoader__.load({
      * screen marked — opening it is what "seeing" the failure means, and the row
      * says so itself.
      */
-    function paintSessionFailure(row, sessionId) {
+    function showsFailure(row, sessionId) {
       const failed = erroredSessionSet.has(sessionId) || clientErrored.has(sessionId);
       // `data-state="ongoing"` is the page's spinner; a live turn is never a
       // failure, however the previous one ended.
       const spinning = row.querySelector('[data-state="ongoing"]') !== null;
       const onScreen = row.getAttribute('aria-selected') === 'true';
-      const wanted = settings.badgeError && failed && !spinning && !onScreen;
+      return settings.badgeError && failed && !spinning && !onScreen;
+    }
+
+    function paintSessionFailure(row, sessionId) {
+      const wanted = showsFailure(row, sessionId);
       if (row.classList.contains('dsh-order-session-errored') !== wanted) {
         row.classList.toggle('dsh-order-session-errored', wanted);
       }
@@ -1777,6 +1839,52 @@ window.__ModuleLoader__.load({
       if (row.classList.contains('dsh-order-session-read') !== retired) {
         row.classList.toggle('dsh-order-session-read', retired);
       }
+    }
+
+    /**
+     * Draw the state the page has no glyph for, in the cell it reserved for one.
+     *
+     * The page paints its dot only for the three states it understands, so the
+     * two corrections above — an unseen failure, and a reply the shared ledger
+     * still calls unread — land on an empty cell whenever the row is otherwise
+     * idle. Recolouring could not reach them, which is why a workspace could wear
+     * the red exclamation with no row inside it wearing anything at all. This
+     * puts a dot of the page's own size and colour in that cell.
+     *
+     * It stands down the moment the page paints its own dot: exactly one mark per
+     * row, and the page's is preferred, since the recolour rules above already
+     * speak for it. `data-mark` rather than `data-state` keeps the two apart.
+     */
+    function paintSessionMark(row, sessionId) {
+      const existing = row.querySelector('.dsh-order-session-mark');
+      const dot = pageStatusDot(row);
+      let wanted = null;
+      if (!dot) {
+        if (showsFailure(row, sessionId)) wanted = 'error';
+        else if (row.classList.contains('dsh-order-session-unread')) wanted = 'done';
+      }
+      if (!wanted) {
+        if (existing) existing.remove();
+        return;
+      }
+      const cell = sessionMarkCell(row);
+      if (!cell) {
+        if (existing) existing.remove();
+        return;
+      }
+      let mark = existing;
+      if (!mark) {
+        mark = document.createElement('span');
+        mark.className = 'dsh-order-session-mark';
+        mark.setAttribute('aria-hidden', 'true');
+      }
+      if (mark.getAttribute('data-mark') !== wanted) {
+        mark.setAttribute('data-mark', wanted);
+        const label = wanted === 'error' ? '该会话异常中断，点开后消失' : '该会话有新回复';
+        mark.title = label;
+      }
+      // After the page's own child, so the slot keeps its contents.
+      if (mark.parentElement !== cell) cell.appendChild(mark);
     }
 
     /**
@@ -2068,7 +2176,8 @@ window.__ModuleLoader__.load({
 
       // 5. Every session on screen carries its own star, and a failed session
       //    wears the failure instead of the plain "finished" the page paints.
-      //    The unread ledger reconciles each row's dot across clients.
+      //    The unread ledger reconciles each row's dot across clients; whatever
+      //    the page leaves unpainted is drawn by the mark that follows.
       for (const sessionRow of document.querySelectorAll('div[data-row-key^="session:"]')) {
         const key = sessionRow.getAttribute('data-row-key') || '';
         const sessionId = key.slice('session:'.length);
@@ -2076,6 +2185,7 @@ window.__ModuleLoader__.load({
         paintSessionStar(sessionRow, sessionId);
         paintSessionUnread(sessionRow, sessionId);
         paintSessionFailure(sessionRow, sessionId);
+        paintSessionMark(sessionRow, sessionId);
       }
     }
 
@@ -2556,7 +2666,7 @@ window.__ModuleLoader__.load({
       rootCtx = ctx;
       document.querySelectorAll('.dsh-order-workspace-header').forEach(el => el.classList.remove('dsh-order-workspace-header'));
       // Older plugin versions did not remove their buttons when reloaded.
-      document.querySelectorAll('.dsh-order-pin-btn, .dsh-order-state, .dsh-order-busy-badge, .dsh-order-star, .dsh-order-star-count, .dsh-order-star-filter').forEach(el => el.remove());
+      document.querySelectorAll('.dsh-order-pin-btn, .dsh-order-state, .dsh-order-busy-badge, .dsh-order-star, .dsh-order-star-count, .dsh-order-star-filter, .dsh-order-session-mark').forEach(el => el.remove());
       document.querySelectorAll('.dsh-order-star-menu').forEach(el => el.remove());
       // These marks live on the page's own containers: unmark, never remove.
       document.querySelectorAll('.dsh-order-current-group').forEach(el => el.classList.remove('dsh-order-current-group'));
@@ -2625,7 +2735,7 @@ window.__ModuleLoader__.load({
           rootCtx = null;
           styleEl.remove();
           document.querySelectorAll('.dsh-order-workspace-header').forEach(el => el.classList.remove('dsh-order-workspace-header'));
-          document.querySelectorAll('.dsh-order-pin-btn, .dsh-order-state, .dsh-order-busy-badge, .dsh-order-star, .dsh-order-star-count, .dsh-order-star-filter').forEach(el => el.remove());
+          document.querySelectorAll('.dsh-order-pin-btn, .dsh-order-state, .dsh-order-busy-badge, .dsh-order-star, .dsh-order-star-count, .dsh-order-star-filter, .dsh-order-session-mark').forEach(el => el.remove());
           document.querySelectorAll('.dsh-order-star-menu').forEach(el => el.remove());
           closeStarMenu();
           document.querySelectorAll('.dsh-order-current-group').forEach(el => el.classList.remove('dsh-order-current-group'));
