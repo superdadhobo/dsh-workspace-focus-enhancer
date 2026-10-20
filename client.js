@@ -211,13 +211,14 @@ window.__ModuleLoader__.load({
         stroke: color-mix(in srgb, currentColor 82%, #000);
       }
 
-      /* A workspace's rolled-up star sits after its name, never over the badge. */
+      /* A workspace's rolled-up star leads the text, ahead of the state badge and
+       * the name — the same order a session row uses (star, then status dot, then
+       * title). The row's own 6px gap supplies the spacing, so no margin here. */
       .dsh-order-star-count {
         display: inline-flex;
         align-items: center;
         gap: 2px;
         flex-shrink: 0;
-        margin-left: 6px;
         color: var(--dsh-order-amber);
         font-size: 12px;
         line-height: 1;
@@ -2143,8 +2144,16 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Paint a workspace row's rolled-up star count, after its name and never in
-     * place of the state badge, which keeps its own leading position.
+     * Paint a workspace row's rolled-up star count. It leads the text, ahead of
+     * the state badge and the name — the same side a session row puts its own
+     * star on — so a favourite that climbs out of a collapsed workspace lands
+     * where the eye already looks for stars instead of at the far right of the
+     * card.
+     *
+     * It sits *before* the badge, never between the badge and the name: the
+     * badge's own placement check requires it to be the title's immediate
+     * predecessor, so anything slipped in after it would make every repaint
+     * move both nodes and the mutation observer would never settle.
      */
     function paintWorkspaceStar(row, count) {
       const titleContainer = row.querySelector('span[class*="projectText"]');
@@ -2171,8 +2180,12 @@ window.__ModuleLoader__.load({
         mark.setAttribute('aria-label', title);
         mark.setAttribute('role', 'img');
       }
-      if (mark.previousElementSibling !== titleContainer) {
-        row.insertBefore(mark, titleContainer.nextSibling);
+      // Ahead of the badge when one is showing, otherwise ahead of the name.
+      const badge = row.querySelector(':scope > .dsh-order-state');
+      const anchor = badge && badge.parentElement === row ? badge : titleContainer;
+      // Only move the mark when needed so the observer stays idle.
+      if (mark.parentElement !== row || mark.nextElementSibling !== anchor) {
+        row.insertBefore(mark, anchor);
       }
     }
 
