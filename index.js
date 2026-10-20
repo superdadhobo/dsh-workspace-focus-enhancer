@@ -393,6 +393,71 @@ export function apply(ctx) {
   }
 
   /**
+   * The Session header facts the Host forwards for one Session, if any.
+   * @returns the header, or undefined for an unknown Session.
+   */
+  function sessionHeaderOf(sessionId) {
+    try {
+      const agent = ctx.agents.get(sessionId);
+      return agent && agent.session ? agent.session.header : void 0;
+    } catch {
+      return void 0;
+    }
+  }
+
+  /**
+   * Whether one Session is a subagent's own log. Only those are folded into the
+   * Session that spawned them: a fork also records a parent, yet a fork is a
+   * workspace Session in its own right and must keep its own badge.
+   */
+  function isSubagentSession(sessionId) {
+    const header = sessionHeaderOf(sessionId);
+    return !!header && header.origin === 'subagent';
+  }
+
+  /**
+   * The top-level Session one subagent Session belongs to. A subagent's Session
+   * is a log of its own, carrying `parentSession` and never listed under a
+   * workspace, so the work it does has to be credited to the Session that
+   * spawned it.
+   * @returns the root Session id, or the input when it is not a subagent's.
+   */
+  function rootSessionOf(sessionId) {
+    let id = sessionId;
+    for (let hops = 0; hops < 16; hops += 1) {
+      if (!isSubagentSession(id)) break;
+      const parent = sessionHeaderOf(id).parentSession;
+      if (typeof parent !== 'string' || !parent || parent === id) break;
+      id = parent;
+    }
+    return id;
+  }
+
+  /**
+   * Root Session ids with work in progress right now, subagent children folded
+   * in. A workspace whose own Session is idle while a subagent it spawned is
+   * still running was reported idle: the child Session belongs to no workspace,
+   * so `busy` never named the card above it and the badge fell through to
+   * "finished, unread" or to nothing at all.
+   * @returns a set of root Session ids.
+   */
+  function runningRootSessions() {
+    const roots = new Set();
+    const running = new Set(activeSessions);
+    let agents = [];
+    try {
+      agents = typeof ctx.agents.list === 'function' ? ctx.agents.list() : [];
+    } catch {
+      agents = [];
+    }
+    for (const agent of agents) {
+      if (agent && agent.id && agent.status === 'running') running.add(agent.id);
+    }
+    for (const sessionId of running) roots.add(rootSessionOf(sessionId));
+    return roots;
+  }
+
+  /**
    * Check which workspaces are currently busy.
    */
   function getBusyWorkspaces(allWorkspaces) {
@@ -400,9 +465,9 @@ export function apply(ctx) {
     // Host entities use `id`; the Remote projection alone uses `workspaceId`.
     const present = new Set(allWorkspaces.map(ws => ws.id));
     for (const id of busyTimestamps.keys()) if (!present.has(id)) busyTimestamps.delete(id);
+    const runningRoots = runningRootSessions();
     for (const ws of allWorkspaces) {
-      if (Array.isArray(ws.sessionIds) && ws.sessionIds.some(id =>
-        activeSessions.has(id) || ctx.agents.get(id)?.status === 'running')) {
+      if (Array.isArray(ws.sessionIds) && ws.sessionIds.some(id => runningRoots.has(id))) {
         busyIds.add(ws.id);
         if (!busyTimestamps.has(ws.id)) {
           busyTimestamps.set(ws.id, Date.now());

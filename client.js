@@ -1324,7 +1324,67 @@ window.__ModuleLoader__.load({
       return merged;
     }
 
-    function stateOfWorkspace(workspaceId, sessionIds, statuses) {
+    /**
+     * Which Session spawned each subagent, from the two places the page records
+     * it: the parent's own catalog, and the subagent flag on its summary. A
+     * subagent's Session is a log of its own and belongs to no workspace, so
+     * without this map its activity has nowhere to land and the workspace card
+     * above the Session that started it reads idle while work is still going on.
+     * @returns a map of child Session id -> the Session that spawned it.
+     */
+    function subagentParentsOf(byId, projections) {
+      const parents = new Map();
+      for (const [parentId, projection] of Object.entries(projections || {})) {
+        const catalog = projection && projection.values && projection.values.subagentCatalog;
+        if (!Array.isArray(catalog)) continue;
+        for (const child of catalog) {
+          if (child && typeof child.id === 'string' && child.id) parents.set(child.id, parentId);
+        }
+      }
+      for (const [id, row] of Object.entries(byId || {})) {
+        if (!row || row.origin !== 'subagent') continue;
+        if (typeof row.parentId !== 'string' || !row.parentId) continue;
+        if (!parents.has(id)) parents.set(id, row.parentId);
+      }
+      return parents;
+    }
+
+    /** The top-level Session one Session belongs to, walking the subagent chain. */
+    function rootSessionIdOf(sessionId, parents) {
+      let id = sessionId;
+      for (let hops = 0; hops < 16; hops += 1) {
+        const parent = parents.get(id);
+        if (typeof parent !== 'string' || !parent || parent === id) break;
+        id = parent;
+      }
+      return id;
+    }
+
+    /**
+     * Root Sessions with a run in progress right now, subagents folded in. The
+     * page knows this per row — that is where its "subagents running" line comes
+     * from — but the workspace badge only ever looked at a Session's own run, so
+     * a parent parked while its child worked read as finished instead.
+     * @param statuses - the page's live per-session status snapshot.
+     * @param byId - the page's session summaries.
+     * @param parents - child -> parent, from {@link subagentParentsOf}.
+     * @returns a set of root Session ids.
+     */
+    function runningRootSessions(statuses, byId, parents) {
+      const roots = new Set();
+      const consider = (id) => {
+        if (typeof id === 'string' && id) roots.add(rootSessionIdOf(id, parents));
+      };
+      for (const [id, status] of statuses) {
+        if (status && status.running === true) consider(id);
+      }
+      for (const [id, row] of Object.entries(byId)) {
+        if (row && row.running === true) consider(id);
+      }
+      return roots;
+    }
+
+    function stateOfWorkspace(workspaceId, sessionIds, statuses, busyRoots) {
       let waiting = false;
       let errored = false;
       let running = false;
@@ -1334,6 +1394,14 @@ window.__ModuleLoader__.load({
       // listed in: one failed session early in the list would hide a question
       // waiting in a later one, though a question outranks a failure.
       for (const id of sessionIds) {
+        // A subagent this Session spawned is still working, so the card is busy
+        // even though the Session's own turn is over. Running outranks the
+        // finished-unread check below, which is what used to paint a green tick
+        // on a workspace that was in fact still being worked on.
+        if (busyRoots && busyRoots.has(id)) {
+          running = true;
+          localUnreadSeenAt.delete(id);
+        }
         const status = statuses.get(id);
         if (status?.running === true) clientErrored.delete(id);
         // A fresh run retires the previous run's local error marker.
@@ -1372,11 +1440,18 @@ window.__ModuleLoader__.load({
       const statuses = live.status.getSnapshot();
       if (!(statuses instanceof Map)) return null;
       const workspaceRows = live.workspaces.list.getSnapshot().items || [];
-      const mainId = Object.values(live.sessions.list.getSnapshot().byId || {})
+      const sessionList = live.sessions.list.getSnapshot();
+      const byId = sessionList.byId || {};
+      const mainId = Object.values(byId)
         .find((session) => (session.retainedBy && session.retainedBy.mainView || 0) > 0)?.id;
+      // Subagent runs belong to the Session that spawned them, not to the child
+      // log the page keeps off to one side, so they are folded in before the
+      // per-workspace walk: a parent parked on a child's work is still busy.
+      const parents = subagentParentsOf(byId, sessionList.projectionsBySession);
+      const busyRoots = runningRootSessions(statuses, byId, parents);
       const own = new Map();
       for (const ws of workspaceRows) {
-        const state = stateOfWorkspace(ws.workspaceId, ws.sessionIds || [], statuses);
+        const state = stateOfWorkspace(ws.workspaceId, ws.sessionIds || [], statuses, busyRoots);
         if (state) own.set(ws.workspaceId, state);
       }
       return { own, states: liftHiddenStates(own, workspaceRows), mainId };

@@ -21,7 +21,7 @@ async function harness(t) {
   let denial, failAuth = false, lastRequest;
   const ctx = {
     connection: { requestRejection(req) { lastRequest = req; if (failAuth) throw Error('auth not ready'); return denial; } },
-    agents: { get: id => agents.get(id) },
+    agents: { get: id => agents.get(id), list: () => [...agents.values()] },
     workspaceRegistry: {
       list: () => [...workspaces], get: id => workspaces.find(w => w.id === id),
       async insertBefore(id, before) {
@@ -133,4 +133,21 @@ test('running, unread, approval and error states reach the status API and clear 
   state=(await h.call()).body;assert.deepEqual(state.unreadSessions,[]);assert.deepEqual(state.erroredSessions,[]);
   h.emit('api-session/status','sc',true);h.emit('api-session/status','sc',false);
   assert.deepEqual((await h.call()).body.unreadSessions,[],'reply watched on screen is already read');
+});
+
+test('a subagent still working keeps its parent workspace busy', async t => {
+  const h=await harness(t);
+  // The child Session is a log of its own: no workspace lists it, and the parent
+  // Session's own turn already ended. Only the parent link ties the work back.
+  h.agents.set('child-1',{id:'child-1',status:'running',session:{header:{origin:'subagent',parentSession:'sp'}}});
+  let state=(await h.call()).body;
+  assert.deepEqual(state.busy,['parent'],'a running subagent counts as its parent working');
+  assert.deepEqual(state.unreadSessions,[],'no finished-unread reply is invented for the parent');
+  h.agents.get('child-1').status='idle';
+  state=(await h.call()).body;
+  assert.deepEqual(state.busy,[],'an idle subagent leaves the workspace idle again');
+  // The registered event still works for a top-level Session with no parent.
+  h.agents.set('top',{id:'top',status:'running',session:{header:{}}});
+  h.workspaces.find(w=>w.id==='idle').sessionIds.push('top');
+  assert.deepEqual((await h.call()).body.busy,['idle']);
 });
