@@ -23,6 +23,9 @@ const CLEAR_ERROR_PATH = '/api/workspace-order/clear-error';
 const SETTINGS_PATH = '/api/workspace-order/settings';
 const TOGGLE_FAVORITE_PATH = '/api/workspace-order/toggle-favorite';
 
+/** The model-facing tool that parks a turn until the user answers. */
+const ASK_USER_TOOL = 'ask_user_question';
+
 /**
  * Mirror the Host's own home resolution (`@deepseek-ai/dsh-home-paths`):
  * explicit `DSH_HOME` first, then `~/.dsh`. A hardcoded `homedir()` would
@@ -189,13 +192,21 @@ export function apply(ctx) {
     });
   }
 
-  ctx.effect(() => () => {
+  ctx.effect(() => async () => {
     disposed = true;
+    queryAbort.abort();
     clearTimeout(reorderTimer);
     reorderTimer = null;
     for (const cancel of pendingBodies) cancel();
     for (const res of pendingResponses) jsonResponse(res, 503, { error: 'Service stopped' });
     pendingResponses.clear();
+    await queryFiber?.dispose?.();
+    // Cordis awaits async effects. A replacement may load the same JSON files
+    // only after every old writer/move/read has settled, including a mutation
+    // which enqueues a reorder after its awaited atomic rename.
+    await ready.catch(() => {});
+    await Promise.allSettled([mutationTask, reorderTask, queryTask]);
+    await reorderTask.catch(() => {});
   }, 'workspace-order: pending work cleanup');
 
   /** Pinned workspace IDs in display order. */
@@ -222,62 +233,253 @@ export function apply(ctx) {
   /** Sessions whose last turn finished with a reply the user has not opened yet. */
   const unreadSessions = new Set();
 
-  /**
-   * The session the page last reported as being looked at. It exists for one
-   * decision only: a turn that ends while its session is on screen has been read
-   * as it arrived, so it does not become "a reply you have not seen". A turn that
-   * ends after the user moved on is unread, because nobody was there to read it.
-   */
-  let mainSessionId = null;
+  // Each browser instance owns a renewable, independent reading lease. A
+  // vanished/hidden tab stops counting without overwriting any other reader.
+  const VIEW_LEASE_MS = 18000;
+  const readingViews = new Map();
+  let legacyReadingLease = null;
+  function isBeingRead(sessionId) {
+    const now = Date.now();
+    for (const [id, view] of readingViews) {
+      if (view.expiresAt <= now) readingViews.delete(id);
+      else if (view.sessionId === sessionId) return true;
+    }
+    if (legacyReadingLease?.expiresAt <= now) legacyReadingLease = null;
+    return legacyReadingLease?.sessionId === sessionId;
+  }
 
-  /**
-   * Read the durable question fold, when the composition provides it: the very
-   * fact the page turns into "waiting for an answer". Declared as an optional
-   * dependency so a composition without it still loads, just blind to questions.
-   * @returns the set of session ids holding an unanswered question.
-   */
-  let questionWaiters = null;
-  ctx.inject(['sessions', 'sessionProjections'], (child) => {
-    questionWaiters = () => {
-      const waiting = new Set();
-      try {
-        for (const session of child.sessions.list()) {
-          const state = child.sessionProjections.stateOf(session, 'userQuestions');
-          const active = state && state.questions ? state.questions.active : void 0;
-          if (!Array.isArray(active)) continue;
-          // `continued` outlived its tool call but is still unanswered, so it counts.
-          if (active.some(q => q && (q.state === 'open' || q.state === 'continued'))) {
-            waiting.add(session.id);
-          }
-        }
-      } catch {
-        // A projection mid-teardown must not take the status route down with it.
-      }
-      return waiting;
-    };
-    child.effect(() => () => {
-      questionWaiters = null;
-    }, 'workspace-order: question fold reader');
+  const headers = new Map();
+  const catalogParents = new Map();
+  const observedState = new Map();
+  const eventVersions = new Map();
+  const turnFacts = new Map();
+  const subagentRuns = new Map();
+  const queryAbort = new AbortController();
+  let queryTask = Promise.resolve();
+  let querying = false;
+  let stateRead = { status: 'ok', catalog: 'ok', failedSessionIds: [], unavailableProjectionSessionIds: [] };
+  let queryBinding = null;
+  // Some custom compositions omit the query service. The plugin still exposes
+  // authenticated routes, explicitly degraded rather than silently blind.
+  const queryFiber = ctx.inject(['sessionQuery'], child => {
+    const abort = new AbortController();
+    const binding = { service: child.sessionQuery, signal: abort.signal };
+    queryBinding = binding;
+    child.effect(() => async () => {
+      abort.abort();
+      if (queryBinding === binding) queryBinding = null;
+      await queryTask.catch(() => {});
+    }, 'workspace-order: logical session query binding');
   });
 
   /**
-   * Sessions waiting for the user right now, from every source the Host owns.
-   * This is the fact the polled fallback was missing: without it a session that
-   * asked a question still looked merely "running" to the browser.
-   * @returns a set of session ids.
+   * Sessions holding a question the user has not answered: callId -> true.
+   *
+   * This is the one wait that is not logged as an approval. The timed
+   * `ask_user_question` variant folds into the durable `userQuestions`
+   * projection, but the blocking variant — the one the standard preset ships
+   * in this build — is not tracked by that fold at all, so a session parked on
+   * a multiple-choice question looked merely "running" to every poll. The
+   * Session event stream names both variants the same way, so the pair
+   * `tool/call` / `tool/result` for that tool is what the Host watches.
    */
-  function waitingSessions() {
-    const waiting = questionWaiters ? questionWaiters() : new Set();
-    for (const [sessionId, ids] of openApprovals) {
-      if (ids.size) waiting.add(sessionId);
+  const openQuestions = new Map();
+
+  /** Summarize a borrowed logical log. Never retain the observation or events. */
+  function summarizeObservation(observation) {
+    const events = observation.events;
+    if (!Array.isArray(events)) throw new Error('Session observation has no logical log');
+    const approvals = new Set(), calls = new Set();
+    let title;
+    for (let i = observation.inheritedEventCount || 0; i < events.length; i += 1) {
+      const event = events[i], data = event?.data;
+      if (event?.type === 'turn/start' || event?.type === 'turn/end') calls.clear();
+      if (!data) continue;
+      if (event.type === 'approval/asked' && typeof data.id === 'string' && data.id) approvals.add(data.id);
+      else if (event.type === 'approval/decided') approvals.delete(data.id);
+      else if (event.type === 'tool/call' && data.name === ASK_USER_TOOL && typeof data.callId === 'string' && data.callId) calls.add(data.callId);
+      else if (event.type === 'tool/result') calls.delete(data.message?.toolCallId);
+      else if (event.type === 'session/title' && typeof data.title === 'string') title = data.title;
     }
+    const values = observation.projections?.values;
+    // Observation projections are WIRE views, not the registry's internal fold.
+    const questions = values?.userQuestions?.active;
+    const projectedWait = Array.isArray(questions) && questions.some(q => q?.state === 'open' || q?.state === 'continued');
+    if (typeof values?.title === 'string') title = values.title;
+    return { waiting: approvals.size > 0 || calls.size > 0 || projectedWait, projectedWaiting: projectedWait,
+      title, catalog: Array.isArray(values?.subagentCatalog) ? values.subagentCatalog.map(entry => entry?.id).filter(id => typeof id === 'string' && id) : [],
+      projectionsAvailable: values !== undefined && Array.isArray(questions) };
+  }
+
+  /** Coalesce overlapping polls; cold reads are non-activating and cancellable. */
+  function refreshSessionState() {
+    if (querying) return queryTask;
+    querying = true;
+    queryTask = (async () => {
+      ensureActive();
+      const binding = queryBinding;
+      if (!binding) {
+        stateRead = { status: 'degraded', catalog: 'unavailable', failedSessionIds: [], unavailableProjectionSessionIds: [] };
+        return;
+      }
+      const service = binding.service;
+      const signal = AbortSignal.any([queryAbort.signal, binding.signal]);
+      const failed = new Set(), unavailable = new Set();
+      const staged = new Map();
+      const previousSources = new Map([...observedState.keys()].map(id => [id, eventVersions.get(id) || 0]));
+      let catalog = 'ok', records = [];
+      try {
+        records = await service.listSessions(signal);
+        if (queryBinding !== binding) throw new Error('Query binding changed');
+        if (!Array.isArray(records)) throw new Error('Invalid logical corpus');
+      } catch {
+        ensureActive();
+        catalog = 'unavailable';
+        records = [];
+      }
+      ensureActive();
+      const ids = new Set();
+      for (const record of records) {
+        const header = record?.header;
+        if (typeof header?.id !== 'string' || !header.id) { catalog = 'unavailable'; continue; }
+        headers.set(header.id, { ...header });
+        ids.add(header.id);
+      }
+      // A successful corpus is authoritative for observable logs. Stale favorite
+      // ids and provider-only external identities need not have a local log; keep
+      // their metadata/marks without turning a missing title into permanent 503.
+      // On listing failure, still try known targets rather than lose live waits.
+      if (catalog === 'unavailable') {
+        for (const ws of ctx.workspaceRegistry.list() || []) for (const id of ws.sessionIds || []) ids.add(id);
+        for (const id of favoriteIds) ids.add(id);
+        for (const id of activeSessions) ids.add(id);
+        for (const run of subagentRuns.values()) ids.add(run.id);
+      }
+      // Stage every source until the entire batch is ready. A fast source can
+      // change while another worker is blocked on disk, so validating only at
+      // the end of that source's worker is not a publication barrier.
+      const readSource = async id => {
+        staged.delete(id);
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          const version = eventVersions.get(id) || 0;
+          let observation;
+          try {
+            observation = await service.observeSession(id, { projectionMode: 'all', signal });
+            ensureActive();
+            if (queryBinding !== binding) throw new Error('Query binding changed');
+            if (observation.header?.id !== id || typeof observation[Symbol.dispose] !== 'function') throw new Error('Invalid observation lease');
+            headers.set(id, { ...observation.header });
+            const state = summarizeObservation(observation);
+            if ((eventVersions.get(id) || 0) !== version) {
+              if (attempt === 0) continue;
+              throw new Error('Session read changed twice');
+            }
+            if (!state.projectionsAvailable) {
+              unavailable.add(id);
+              const previous = observedState.get(id);
+              state.projectedWaiting = previous?.projectedWaiting || false;
+              state.waiting ||= state.projectedWaiting;
+              state.title ??= previous?.title;
+            } else unavailable.delete(id);
+            state.readVersion = version;
+            staged.set(id, { state, version });
+            failed.delete(id);
+          } catch {
+            ensureActive();
+            failed.add(id);
+            // Keep last-good waiting/title facts; failure is not a negative read.
+          } finally {
+            try { observation?.[Symbol.dispose]?.(); }
+            catch { failed.add(id); staged.delete(id); }
+          }
+          break;
+        }
+      };
+      const readBatch = async ordered => {
+        let cursor = 0;
+        const worker = async () => {
+          while (cursor < ordered.length) {
+            ensureActive();
+            await readSource(ordered[cursor++]);
+          }
+        };
+        // Drain all workers even if teardown aborts one before its peers settle.
+        await Promise.allSettled(Array.from({ length: Math.min(4, ordered.length) }, () => worker()));
+      };
+      const invalidatedSources = () => [...staged].filter(([id, cut]) =>
+        (eventVersions.get(id) || 0) !== cut.version).map(([id]) => id);
+      await readBatch([...ids]);
+      for (let round = 0; round < 2; round += 1) {
+        const invalidated = invalidatedSources();
+        if (!invalidated.length) break;
+        await readBatch(invalidated);
+      }
+      ensureActive();
+      if (queryBinding !== binding) catalog = 'unavailable';
+      // No await between this final all-source check and publication. A source
+      // still changing after bounded rereads is explicitly degraded, never a
+      // 200/ok stale cut; its previous durable summary remains available.
+      for (const id of invalidatedSources()) { failed.add(id); staged.delete(id); }
+      if (queryBinding === binding) {
+        for (const [id, { state }] of staged) {
+          for (const childId of state.catalog) {
+            const prior = catalogParents.get(childId);
+            catalogParents.set(childId, prior === undefined || prior === id ? id : null);
+          }
+          observedState.set(id, state);
+        }
+      }
+      if (catalog === 'ok') {
+        for (const [id, version] of previousSources) {
+          if (ids.has(id)) continue;
+          if ((eventVersions.get(id) || 0) !== version) { failed.add(id); continue; }
+          // A full successful logical listing, unlike Agent detach, proves this
+          // formerly observed source has gone. Retire only its wait/title facts
+          // (and their live wait overlays); terminal reminders, favorites, header
+          // lineage and provider-only lifecycle identities are deliberately kept.
+          observedState.delete(id);
+          openApprovals.delete(id);
+          openQuestions.delete(id);
+        }
+      }
+      stateRead = { status: catalog === 'ok' && !failed.size && !unavailable.size ? 'ok' : 'degraded',
+        catalog, failedSessionIds: [...failed], unavailableProjectionSessionIds: [...unavailable] };
+    })().finally(() => { querying = false; });
+    return queryTask;
+  }
+
+  function waitingSessions() {
+    const waiting = new Set();
+    const add = sessionId => waiting.add(rootSessionOf(sessionId));
+    for (const [sessionId, state] of observedState) if (state.waiting) add(sessionId);
+    for (const [sessionId, ids] of openApprovals) if (ids.size) add(sessionId);
+    for (const [sessionId, calls] of openQuestions) if (calls.size) add(sessionId);
     return waiting;
+  }
+
+  function attributedSessions(sources) {
+    return new Set([...sources].map(rootSessionOf));
+  }
+
+  function hasReply(message) {
+    return Array.isArray(message?.content) && message.content.some(block =>
+      block?.type === 'text' && typeof block.text === 'string' && block.text.trim() !== '' || block?.type === 'image');
+  }
+
+  function finishTurn(sessionId, reason, reply) {
+    const root = rootSessionOf(sessionId);
+    if (reason === 'error') {
+      erroredSessions.add(sessionId);
+      unreadSessions.delete(sessionId);
+    } else if (reason === 'completed' && reply && !erroredSessions.has(sessionId) && !isBeingRead(root)) {
+      unreadSessions.add(sessionId);
+    }
   }
 
   /**
    * The registered workspace whose directory most closely contains this one, by
    * the same longest-prefix rule the page uses to nest workspaces. The browser
-   * needs this to lift a hidden child's badge onto a collapsed ancestor.
+   * needs this to lift a hidden child's glyph onto a collapsed ancestor.
    * @returns a workspace id, or undefined at the top level.
    */
   function parentWorkspaceOf(workspace, all) {
@@ -398,21 +600,10 @@ export function apply(ctx) {
    */
   function sessionHeaderOf(sessionId) {
     try {
-      const agent = ctx.agents.get(sessionId);
-      return agent && agent.session ? agent.session.header : void 0;
-    } catch {
-      return void 0;
-    }
-  }
-
-  /**
-   * Whether one Session is a subagent's own log. Only those are folded into the
-   * Session that spawned them: a fork also records a parent, yet a fork is a
-   * workspace Session in its own right and must keep its own badge.
-   */
-  function isSubagentSession(sessionId) {
-    const header = sessionHeaderOf(sessionId);
-    return !!header && header.origin === 'subagent';
+      const header = ctx.agents.get(sessionId)?.session?.header;
+      if (header?.id === sessionId) headers.set(sessionId, { ...header });
+    } catch { /* An Agent may detach; its immutable header remains usable. */ }
+    return headers.get(sessionId);
   }
 
   /**
@@ -424,20 +615,25 @@ export function apply(ctx) {
    */
   function rootSessionOf(sessionId) {
     let id = sessionId;
-    for (let hops = 0; hops < 16; hops += 1) {
-      if (!isSubagentSession(id)) break;
-      const parent = sessionHeaderOf(id).parentSession;
-      if (typeof parent !== 'string' || !parent || parent === id) break;
+    const seen = new Set([id]);
+    for (let hops = 0; hops < 64; hops += 1) {
+      const header = sessionHeaderOf(id);
+      // A fork has a parent too, but is a distinct workspace conversation.
+      const parent = header?.origin === 'subagent' ? header.parentSession
+        : header?.origin === undefined ? catalogParents.get(id) : undefined;
+      if (typeof parent !== 'string' || !parent) return id;
+      if (seen.has(parent)) return sessionId;
+      seen.add(parent);
       id = parent;
     }
-    return id;
+    return sessionId;
   }
 
   /**
    * Root Session ids with work in progress right now, subagent children folded
    * in. A workspace whose own Session is idle while a subagent it spawned is
    * still running was reported idle: the child Session belongs to no workspace,
-   * so `busy` never named the card above it and the badge fell through to
+   * so `busy` never named the card above it and the glyph fell through to
    * "finished, unread" or to nothing at all.
    * @returns a set of root Session ids.
    */
@@ -453,19 +649,21 @@ export function apply(ctx) {
     for (const agent of agents) {
       if (agent && agent.id && agent.status === 'running') running.add(agent.id);
     }
+    for (const run of subagentRuns.values()) if (run.running) running.add(run.id);
     for (const sessionId of running) roots.add(rootSessionOf(sessionId));
     return roots;
   }
 
   /**
    * Check which workspaces are currently busy.
+   * @param runningRoots - the running root Session ids, when the caller has
+   * already read them; otherwise they are read here.
    */
-  function getBusyWorkspaces(allWorkspaces) {
+  function getBusyWorkspaces(allWorkspaces, runningRoots = runningRootSessions()) {
     const busyIds = new Set();
     // Host entities use `id`; the Remote projection alone uses `workspaceId`.
     const present = new Set(allWorkspaces.map(ws => ws.id));
     for (const id of busyTimestamps.keys()) if (!present.has(id)) busyTimestamps.delete(id);
-    const runningRoots = runningRootSessions();
     for (const ws of allWorkspaces) {
       if (Array.isArray(ws.sessionIds) && ws.sessionIds.some(id => runningRoots.has(id))) {
         busyIds.add(ws.id);
@@ -483,13 +681,7 @@ export function apply(ctx) {
    * Workspaces holding a session whose last failure is still unseen.
    */
   function getErroredWorkspaces(allWorkspaces) {
-    const erroredIds = [];
-    for (const ws of allWorkspaces) {
-      if (Array.isArray(ws.sessionIds) && ws.sessionIds.some(id => erroredSessions.has(id))) {
-        erroredIds.push(ws.id);
-      }
-    }
-    return erroredIds;
+    return workspacesHolding(allWorkspaces, attributedSessions(erroredSessions));
   }
 
   /** Every workspace holding at least one of these sessions. */
@@ -506,7 +698,7 @@ export function apply(ctx) {
 
   /**
    * Workspace nesting as child -> the workspace whose folder contains it. The
-   * page renders a collapsed group's rows nowhere, so a badge for a session
+   * page renders a collapsed group's rows nowhere, so a glyph for a session
    * inside one has to be drawn on an ancestor that is still on screen; sending
    * the tree is what lets the browser find that ancestor on its own.
    */
@@ -534,24 +726,42 @@ export function apply(ctx) {
 
   /**
    * Status payload shared by both read-only routes. `waiting` is why this
-   * payload exists at all for a badge: a session parked on a question is not
+   * payload exists at all for a glyph: a session parked on a question is not
    * merely busy, and the browser cannot tell the two apart from `busy` alone.
    */
   function statusPayload() {
     const all = ctx.workspaceRegistry.list() || [];
-    const busy = getBusyWorkspaces(all);
+    const runningRoots = runningRootSessions();
+    const busy = getBusyWorkspaces(all, runningRoots);
     reconcile(all);
     const waiting = waitingSessions();
+    const unread = attributedSessions(unreadSessions);
+    const errors = attributedSessions(erroredSessions);
+    const sessionTitles = Object.fromEntries([...observedState].filter(([, state]) => typeof state.title === 'string' && state.title.trim()).map(([id, state]) => [id, state.title]));
+    // The route's await can yield once after the query publication barrier.
+    // Recheck at the synchronous HTTP payload boundary too: any later event
+    // makes this an explicitly degraded cut until the next bounded read.
+    const stale = [...observedState].filter(([id, state]) => state.readVersion !== (eventVersions.get(id) || 0)).map(([id]) => id);
+    const payloadRead = stale.length ? { ...stateRead, status: 'degraded',
+      failedSessionIds: [...new Set([...stateRead.failedSessionIds, ...stale])] } : stateRead;
     return {
       protocolVersion: 2,
       pinned: pinnedIds,
       busy: Array.from(busy),
+      // The same fact per Session. The browser cannot derive it from `busy`
+      // alone: a workspace only says "something in here runs", while a session
+      // row has to know whether *it* is the one running — and a subagent's own
+      // log is never named by `busy` at all.
+      runningSessions: Array.from(runningRoots),
       waiting: workspacesHolding(all, waiting),
       waitingSessions: Array.from(waiting),
       errored: getErroredWorkspaces(all),
-      erroredSessions: Array.from(erroredSessions),
-      unread: workspacesHolding(all, unreadSessions),
-      unreadSessions: Array.from(unreadSessions),
+      erroredSessions: Array.from(errors),
+      unread: workspacesHolding(all, unread),
+      unreadSessions: Array.from(unread),
+      archivedSessions: Array.from(ctx.workspaceRegistry.archivedSessionIds || []),
+      sessionTitles,
+      stateRead: payloadRead,
       parents: workspaceParents(all),
       owners: sessionOwners(all),
       favorites: favoriteIds,
@@ -674,75 +884,102 @@ export function apply(ctx) {
       console.warn('[workspace-order] Startup reorder error:', err);
     });
 
-  // Listen to session status changes
+  // A boolean residency/status edge is not a completion fact.
   ctx.on('api-session/status', (sessionId, running) => {
     if (disposed) return;
-    // Snapshot the transition now, before an awaited reorder can blur the
-    // relative times of two workspaces entering busy state.
+    sessionHeaderOf(sessionId);
     getBusyWorkspaces(ctx.workspaceRegistry.list() || []);
     if (running) {
       activeSessions.add(sessionId);
-      getBusyWorkspaces(ctx.workspaceRegistry.list() || []);
-      // A fresh run means the user is acting on it; the red mark has been seen.
+      if (!turnFacts.has(sessionId)) turnFacts.set(sessionId, { reply: false, failed: false });
       erroredSessions.delete(sessionId);
       unreadSessions.delete(sessionId);
-    } else {
-      // Only a run this process actually watched can "finish", so a session that
-      // stops for any other reason cannot invent a finished-unread reminder.
-      const finishedHere = activeSessions.delete(sessionId);
-      // A session the user is looking at is not unread: the reply is on screen.
-      // The page reports the session it is showing before this turn ends, so the
-      // comparison is against what is on screen right now, not where the user was
-      // when the turn began.
-      if (finishedHere && sessionId !== mainSessionId) unreadSessions.add(sessionId);
-    }
+    } else activeSessions.delete(sessionId);
     getBusyWorkspaces(ctx.workspaceRegistry.list() || []);
     requestReorder();
   });
 
-  // An approval ask opens a wait; its decision closes it. The event pair is the
-  // only way to see pending approvals, which no service enumerates.
   ctx.on('session/event', (session, event) => {
-    const sessionId = session && session.id;
-    if (disposed || !sessionId || !event) return;
-    // Only a well-formed id may enter the set: a malformed ask would otherwise
-    // park a `undefined` member that only the matching malformed decision could
-    // remove, pinning the workspace on "waiting" until restart.
-    const requestId = event.data && typeof event.data.id === 'string' ? event.data.id : void 0;
-    if (!requestId) return;
-    if (event.type === 'approval/asked') {
+    const sessionId = session?.id, data = event?.data;
+    if (disposed || !sessionId || !data) return;
+    if (session.header?.id === sessionId) headers.set(sessionId, { ...session.header });
+    // A read cut invalidated by live events is retried before publication. Keep
+    // last-good durable facts during the read: an unrelated step/message must
+    // not temporarily erase a timed-continued question on a degraded poll.
+    eventVersions.set(sessionId, (eventVersions.get(sessionId) || 0) + 1);
+    if (event.type === 'turn/start') {
+      turnFacts.set(sessionId, { turn: data.turn, reply: false, failed: false });
+      openQuestions.delete(sessionId);
+      erroredSessions.delete(sessionId);
+      unreadSessions.delete(sessionId);
+    } else if (event.type === 'assistant/message') {
+      const facts = turnFacts.get(sessionId);
+      if (facts && (facts.turn === undefined || facts.turn === data.turn) && !data.interrupted && hasReply(data.message)) facts.reply = true;
+    } else if (event.type === 'turn/end') {
+      const facts = turnFacts.get(sessionId);
+      const matches = facts && (facts.turn === undefined || facts.turn === data.turn);
+      if (matches) finishTurn(sessionId, facts.failed ? 'error' : data.reason?.kind, facts.reply);
+      turnFacts.delete(sessionId);
+      openQuestions.delete(sessionId);
+    } else if (event.type === 'tool/call' && data.name === ASK_USER_TOOL && typeof data.callId === 'string' && data.callId) {
+      let calls = openQuestions.get(sessionId);
+      if (!calls) openQuestions.set(sessionId, calls = new Set());
+      calls.add(data.callId);
+    } else if (event.type === 'tool/result') {
+      const calls = openQuestions.get(sessionId);
+      calls?.delete(data.message?.toolCallId);
+      if (!calls?.size) openQuestions.delete(sessionId);
+    } else if (event.type === 'approval/asked' && typeof data.id === 'string' && data.id) {
       let ids = openApprovals.get(sessionId);
       if (!ids) openApprovals.set(sessionId, ids = new Set());
-      ids.add(requestId);
-    } else if (event.type === 'approval/decided') {
+      ids.add(data.id);
+    } else if (event.type === 'approval/decided' && typeof data.id === 'string') {
       const ids = openApprovals.get(sessionId);
-      if (!ids) return;
-      ids.delete(requestId);
-      if (!ids.size) openApprovals.delete(sessionId);
-    } else {
-      return;
+      ids?.delete(data.id);
+      if (!ids?.size) openApprovals.delete(sessionId);
+    } else if (event.type === 'subagent/catalog' && typeof data.childId === 'string' && data.childId) {
+      const prior = catalogParents.get(data.childId);
+      catalogParents.set(data.childId, prior === undefined || prior === sessionId ? sessionId : null);
     }
-    // The question a turn asked may already be answered; the wait is re-read
-    // at report time, so only the approval change needs announcing here.
     requestReorder();
   });
 
-  // A turn that stopped on an error needs the user's attention.
-  ctx.on('api-session/error', (sessionId) => {
+  ctx.on('api-session/error', sessionId => {
     if (disposed) return;
+    sessionHeaderOf(sessionId);
     erroredSessions.add(sessionId);
+    unreadSessions.delete(sessionId);
+    const facts = turnFacts.get(sessionId);
+    if (facts) facts.failed = true;
   });
 
+  // Native removed means Agent detach, not deletion of the logical Session.
   ctx.on('api-session/removed', sessionId => {
     if (disposed) return;
-    const wasTracked = activeSessions.has(sessionId) || erroredSessions.has(sessionId)
-      || unreadSessions.has(sessionId) || openApprovals.has(sessionId);
+    sessionHeaderOf(sessionId);
     activeSessions.delete(sessionId);
-    openApprovals.delete(sessionId);
-    erroredSessions.delete(sessionId);
-    unreadSessions.delete(sessionId);
-    if (mainSessionId === sessionId) mainSessionId = null;
-    if (wasTracked) requestReorder();
+    requestReorder();
+  });
+
+  ctx.on('subagent/start', info => {
+    if (disposed || typeof info?.id !== 'string' || !info.id || typeof info.runId !== 'string' || !info.runId || subagentRuns.has(info.runId)) return;
+    sessionHeaderOf(info.id);
+    subagentRuns.set(info.runId, { id: info.id, local: info.local === true, running: true });
+    erroredSessions.delete(info.id);
+    unreadSessions.delete(info.id);
+    requestReorder();
+  });
+  ctx.on('subagent/end', info => {
+    if (disposed || typeof info?.runId !== 'string') return;
+    const run = subagentRuns.get(info.runId);
+    if (!run?.running || run.id !== info.id) return;
+    run.running = false;
+    activeSessions.delete(run.id);
+    // Local logs publish their own turn/end; don't acknowledge the same reply
+    // twice after a reader has cleared its mark. External epochs have no such
+    // local stream, so their paired terminal edge supplies the completion fact.
+    if (!run.local || info.stopReason === 'error') finishTurn(run.id, info.stopReason, hasReply({ content: info.lastAssistantMessage }));
+    requestReorder();
   });
 
   // Register HTTP endpoint: GET status
@@ -756,7 +993,9 @@ export function apply(ctx) {
       }
       try {
         await ready;
-        jsonResponse(res, 200, statusPayload());
+        await refreshSessionState();
+        const payload = statusPayload();
+        jsonResponse(res, payload.stateRead.status === 'degraded' ? 503 : 200, payload);
       } catch (err) {
         jsonResponse(res, err.status || 500, { error: String(err) });
       }
@@ -785,6 +1024,7 @@ export function apply(ctx) {
         const committed = await mutate(async () => {
           const next = { ...settings, ...patch };
           await saveSettings(next);
+          ensureActive();
           settings = next;
           await reorderAfterCommit();
           return settings;
@@ -807,32 +1047,32 @@ export function apply(ctx) {
       try {
         const body = await readJsonBody(req, pendingBodies);
         await mutate(() => {
-          const { sessionId, workspaceId } = body;
-          // The page reports the session it is showing, including "none" when the
-          // user has closed every session. Opening a session retires both of its
-          // marks: the failure has been seen, and the reply has been read.
+          const { sessionId, workspaceId, viewId } = body;
+          const modern = Object.hasOwn(body, 'viewId');
+          if (modern && (typeof viewId !== 'string' || !viewId.trim() || viewId.length > 256)) {
+            return jsonResponse(res, 400, { error: 'Invalid viewId' });
+          }
+          const clearSeen = seen => {
+            for (const source of erroredSessions) if (rootSessionOf(source) === seen || source === seen) erroredSessions.delete(source);
+            for (const source of unreadSessions) if (rootSessionOf(source) === seen || source === seen) unreadSessions.delete(source);
+          };
           if (sessionId === null || typeof sessionId === 'string') {
             const seen = sessionId || null;
-            // Nothing is undone on the way out. A turn that ended while its session
-            // was on screen was read as it arrived, so it was never marked unread;
-            // re-raising it when the user looked elsewhere put a "new reply" check
-            // on a conversation they had just read.
-            if (seen) {
-              erroredSessions.delete(seen);
-              unreadSessions.delete(seen);
-            }
-            mainSessionId = seen;
+            const lease = { sessionId: seen, expiresAt: Date.now() + VIEW_LEASE_MS };
+            if (modern) {
+              for (const [id, view] of readingViews) if (view.expiresAt <= Date.now()) readingViews.delete(id);
+              if (seen) readingViews.set(viewId, lease);
+              else readingViews.delete(viewId);
+            } else legacyReadingLease = lease;
+            if (seen) clearSeen(seen);
             return jsonResponse(res, 200, { success: true });
           }
-          if (typeof workspaceId === 'string' && workspaceId) {
+          if (!modern && typeof workspaceId === 'string' && workspaceId) {
             const ws = ctx.workspaceRegistry.get(workspaceId);
             if (!ws) {
               return jsonResponse(res, 404, { error: 'Workspace not found' });
             }
-            for (const id of ws.sessionIds || []) {
-              erroredSessions.delete(id);
-              unreadSessions.delete(id);
-            }
+            for (const id of ws.sessionIds || []) clearSeen(id);
             return jsonResponse(res, 200, { success: true });
           }
           jsonResponse(res, 400, { error: 'Invalid sessionId' });
@@ -873,12 +1113,14 @@ export function apply(ctx) {
           if (desired !== present) {
             const next = desired ? [workspaceId, ...pinnedIds] : pinnedIds.filter(id => id !== workspaceId);
             await savePins(next);
+            ensureActive();
             pinnedIds = next;
             await reorderAfterCommit();
           }
           return desired;
         });
 
+        await refreshSessionState();
         const payload = statusPayload();
 
         jsonResponse(res, 200, {
@@ -887,13 +1129,18 @@ export function apply(ctx) {
           pinned,
           pinnedIds: payload.pinned,
           busyIds: payload.busy,
+          runningSessionIds: payload.runningSessions,
           waitingIds: payload.waiting,
+          waitingSessionIds: payload.waitingSessions,
           unreadIds: payload.unread,
           unreadSessionIds: payload.unreadSessions,
           erroredIds: payload.errored,
           erroredSessionIds: payload.erroredSessions,
           parents: payload.parents,
-          owners: payload.owners
+          owners: payload.owners,
+          archivedSessionIds: payload.archivedSessions,
+          sessionTitles: payload.sessionTitles,
+          stateRead: payload.stateRead
         });
       } catch (err) {
         jsonResponse(res, err.status || 500, { error: String(err) });
@@ -924,6 +1171,7 @@ export function apply(ctx) {
           if (favorite !== present) {
             const next = favorite ? [sessionId, ...favoriteIds] : favoriteIds.filter(id => id !== sessionId);
             await saveFavorites(next);
+            ensureActive();
             favoriteIds = next;
           }
           return { success: true, sessionId, favorite, favoriteIds };

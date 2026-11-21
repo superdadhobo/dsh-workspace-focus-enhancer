@@ -1,7 +1,10 @@
 {
   "name": "dsh-workspace-focus-enhancer",
-  "version": "0.1.7",
-  "description": "dsh工作区专注增强：图钉置顶、有会话运行时自动前移、点开一个工作区自动折叠其他、当前工作区高亮、会话状态徽标（橙问号=等你回答、红感叹号=异常中断、旋转圈=进行中、绿勾=完成未读）、会话收藏（星标可上浮到工作区并显示数量）。Workspace focus enhancements for the DeepSeek Harness web UI: pin & auto-order workspaces, auto-collapse, current highlight, session status badges, and session favorites.",
+  "version": "0.2.0",
+  "engines": {
+    "dsh": ">=0.2.2-rc.5"
+  },
+  "description": "dsh工作区专注增强：图钉置顶、有会话运行时自动前移、点开一个工作区自动折叠其他、当前工作区高亮、工作区状态改为会填充的文件夹（直接顶替文件夹图标、轮廓与官方一致：绿=绿色小蛇在文件夹里绕圈跑、橙=下排常亮上排闪烁、红=两排方块散落掉出再重砌、完成未读=八格实心静止，颜色与会话行同源）、会话收藏（星标可上浮到工作区并显示数量）。Workspace focus enhancements for the DeepSeek Harness web UI: pin & auto-order workspaces, auto-collapse, current highlight, workspace state folders that fill in place of the folder icon, and session favorites.",
   "license": "MIT",
   "author": "superdadhobo",
   "repository": {
@@ -23,7 +26,8 @@
     ".": "./index.js",
     "./client": "./client.js",
     "./package.json": "./package.json",
-    "./locale/*": "./locale/*"
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
@@ -32,7 +36,8 @@
     "package.json",
     "README.md",
     "LICENSE",
-    "locale"
+    "locale",
+    "icon.svg"
   ],
   "dsh": {
     "bundle": {

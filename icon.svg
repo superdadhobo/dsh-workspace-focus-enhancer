@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 36 36" role="img" aria-label="Workspace focus enhancer">
+  <!--
+    One dominant subject: a workspace folder carrying the plugin's own state
+    mark. The folder is drawn in the harness's neutral folder silhouette so it
+    reads beside the installed plugin icons; the filled dot inside is the
+    "something in here needs you" state the plugin paints on workspace rows.
+    Flat fills only, no tile or background, per the artwork rules.
+  -->
+  <path d="M5 11.5A2.5 2.5 0 0 1 7.5 9h6.2c.7 0 1.35.3 1.82.82L17.1 11.6h11.4A2.5 2.5 0 0 1 31 14.1v11.4a2.5 2.5 0 0 1-2.5 2.5h-21A2.5 2.5 0 0 1 5 25.5z" fill="#8b93a1"/>
+  <path d="M5 16.2h26v9.3a2.5 2.5 0 0 1-2.5 2.5h-21A2.5 2.5 0 0 1 5 25.5z" fill="#a9b0bb"/>
+  <circle cx="18" cy="21" r="3.6" fill="#22c55e"/>
+</svg>

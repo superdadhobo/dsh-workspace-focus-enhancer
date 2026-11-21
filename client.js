@@ -6,18 +6,22 @@
  *    - Hover to reveal on normal workspaces.
  *    - Always visible & highlighted when pinned.
  *    - Click to toggle pin without expanding/collapsing the workspace.
- * 2. One state badge before the workspace title, resolved in this priority:
+ * 2. One state glyph in the workspace row's folder slot, resolved in this
+ *    priority:
  *    - orange question mark : a session in the workspace waits for the user
  *      (approval, plan review, or a question);
  *    - red exclamation mark : a session stopped on an error and is unseen;
  *    - spinning ring        : a session is running;
  *    - green check          : a session finished and its output is unread;
- *    - nothing              : the workspace is idle.
+ *    - the page's own folder icon : the workspace is idle.
+ *    The glyph takes the place of the folder icon rather than standing next
+ *    to it, so the row keeps its width and the workspace name stays exactly
+ *    where an idle row's name is.
  *    The live waiting/running/unread facts come from the Host's own session
  *    status store when the page exposes it, and from the Host's polled status
  *    otherwise; the two are merged per row, so a fact only one of them knows
- *    still reaches the badge. A workspace whose row is hidden because an
- *    ancestor is collapsed hands its badge up to the nearest visible ancestor,
+ *    still reaches the glyph. A workspace whose row is hidden because an
+ *    ancestor is collapsed hands its glyph up to the nearest visible ancestor,
  *    so collapsing a group never hides that something inside needs attention.
  * 3. Synchronization with the backend ordering service.
  */
@@ -27,23 +31,53 @@ window.__ModuleLoader__.load({
   factory: (require) => {
     const module = { exports: {} };
 
-    // The page ships these as built-in modules; requiring them keeps the panel
-    // visually identical to the official plugin cards.
+    // Only the two baseline React modules are requested from the page's module
+    // table. They are the documented baseline every Client bundle may import.
+    //
+    // The Harness Client UI packages are deliberately NOT required here.
+    // `@deepseek-ai/dsh-client-ui-primitives` and `@deepseek-ai/dsh-client-store`
+    // are internal implementation modules: their exports change without notice,
+    // and a missing export would silently drop the whole settings card (the
+    // panel used to gate itself on `primitives.Switch`). Every control the card
+    // needs is therefore built here from plain elements plus the host's
+    // `--dsw-alias-*` theme tokens, copying the shipped switch/tag/disclosure
+    // markup and behaviour so the card still looks like an official one.
     let react = null;
     let jsxRuntime = null;
-    let primitives = null;
-    let createStore = null;
     let uiAvailable = false;
     try {
       react = require('react');
       jsxRuntime = require('react/jsx-runtime');
-      primitives = require('@deepseek-ai/dsh-client-ui-primitives');
-      createStore = require('@deepseek-ai/dsh-client-store').createSnapshotStore;
-      uiAvailable = !!(react && jsxRuntime && primitives && primitives.Switch && createStore);
-      // The collapsible group needs two more official pieces; without them the
-      // panel still works, just with every switch listed flat.
+      uiAvailable = !!(react && jsxRuntime && typeof react.useState === 'function');
     } catch {
       uiAvailable = false;
+    }
+
+    /**
+     * A minimal observable snapshot store, the shape the slot `inject` face
+     * accepts under `hooks` (`getSnapshot` + `subscribe`). It replaces the
+     * `@deepseek-ai/dsh-client-store` dependency: the renderer binds any such
+     * source to a selector hook itself, so a plain object is enough.
+     * @param initial - first snapshot.
+     * @returns store with get/set/subscribe.
+     */
+    function createLocalStore(initial) {
+      let snapshot = initial;
+      const listeners = new Set();
+      return {
+        getSnapshot: () => snapshot,
+        subscribe: (listener) => {
+          listeners.add(listener);
+          return () => { listeners.delete(listener); };
+        },
+        set: (next) => {
+          if (next === snapshot) return;
+          snapshot = next;
+          for (const listener of [...listeners]) {
+            try { listener(); } catch {}
+          }
+        }
+      };
     }
 
     const CSS = `
@@ -211,9 +245,9 @@ window.__ModuleLoader__.load({
         stroke: color-mix(in srgb, currentColor 82%, #000);
       }
 
-      /* A workspace's rolled-up star leads the text, ahead of the state badge and
-       * the name — the same order a session row uses (star, then status dot, then
-       * title). The row's own 6px gap supplies the spacing, so no margin here. */
+      /* A workspace's rolled-up star leads the text, ahead of the name — the
+       * same order a session row uses (star, then status dot, then title). The
+       * row's own 6px gap supplies the spacing, so no margin here. */
       .dsh-order-star-count {
         display: inline-flex;
         align-items: center;
@@ -310,6 +344,14 @@ window.__ModuleLoader__.load({
         background: var(--dsw-alias-bg-layer-3, #2b2b2b);
         box-shadow: 0 8px 24px var(--dsw-alias-bg-mask-1, rgba(0, 0, 0, 0.24));
         border: 0.5px solid var(--dsw-alias-border-l4, rgba(255, 255, 255, 0.16));
+        /*
+         * macOS Desktop only excludes interactive controls inside a declared
+         * window region. This menu is appended to body, outside any drag row, so
+         * it declares its own exclusion: its buttons stay clickable instead of
+         * dragging the window, and its visible box is what the region
+         * calculation uses.
+         */
+        -webkit-app-region: no-drag;
       }
 
       .dsh-order-star-menu-empty {
@@ -354,253 +396,347 @@ window.__ModuleLoader__.load({
         color: var(--dsw-alias-label-tertiary, rgba(255, 255, 255, 0.45));
       }
 
-      /* One workspace state badge: spinner, question, check, or alert. */
+      /* One workspace state badge: a folder that fills with colour.
+       *
+       * It is the app's own folder icon — same path, same 1-unit stroke, same
+       * 16-unit box — redrawn here so that its inside can be filled. It stands
+       * in the row's folder slot rather than standing next to it, so it is
+       * 16px, the exact width of the icon it replaces, and it carries no
+       * margin: the row's own 6px gap does the spacing. The name therefore
+       * lands where it lands on an idle row, and a workspace that has
+       * something to say costs the list nothing in width.
+       *
+       * Two vocabularies, one per column. A session row keeps its own marks —
+       * orange question mark, red exclamation mark, green check — because a
+       * mark the size of a dot has to say its state without a surround to put
+       * it in. A workspace row *is* a container, so it says its state by how
+       * full it is and from where the fill came: the green, the amber and the
+       * red are shared with the session column, the shape and the motion are
+       * not. One colour, one meaning; one column, one way of drawing it. */
       .dsh-order-state {
-        width: 14px;
-        height: 14px;
+        width: 16px;
+        height: 16px;
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        flex-shrink: 0;
+        flex: none;
         align-self: center;
-        margin-right: 6px;
       }
 
       .dsh-order-state svg {
-        width: 14px;
-        height: 14px;
+        width: 16px;
+        height: 16px;
         display: block;
       }
 
+      /*
+       * A row that carries a state gives up its folder icon: the state glyph
+       * takes that slot, so the row keeps its width and its name stays where
+       * it was.
+       *
+       * The hover arrow goes with it. The app swaps its folder for an arrow
+       * when the pointer is over the row, and that swap is two icons in one
+       * slot — but this slot already holds the state. The state wins that
+       * contest, because a folder icon is decoration while the state is the
+       * one thing the row is there to say, and the row stays just as
+       * clickable without the arrow.
+       */
+      div[data-row-key^="workspace:"].dsh-order-has-state > span[class*="folder"],
+      div[data-row-key^="workspace:"].dsh-order-has-state > span[class*="chevron"] {
+        display: none !important;
+      }
+
+      .dsh-order-state[data-state="waiting"],
       .dsh-order-state[data-state="waiting"] svg {
         color: var(--dsh-order-amber);
       }
 
+      .dsh-order-state[data-state="error"],
       .dsh-order-state[data-state="error"] svg {
         color: var(--dsh-order-red);
       }
 
+      .dsh-order-state[data-state="done"],
       .dsh-order-state[data-state="done"] svg {
         color: var(--dsh-order-green);
       }
 
-      /* Running: one arc sweeping around a faint track, matching the Host row spinner. */
-      .dsh-order-state[data-state="running"] {
+      /* Running: the folder fills with the same green the session spinner uses. */
+      .dsh-order-state[data-state="running"],
+      .dsh-order-state[data-state="running"] svg {
         color: var(--dsh-order-green);
       }
 
-      .dsh-order-state .dsh-spin-track {
-        fill: none;
-        stroke: currentColor;
-        stroke-width: 2.5;
-        opacity: 0.22;
+      /* The folder itself, in the state's colour.
+       *
+       * The outline is the app's own folder path at its own 1-unit weight, so a
+       * workspace at work and a workspace at rest are the same drawing at the
+       * same size; only the inside differs. The faint body under the cells is
+       * what makes the empty part of the folder visible at all — without it a
+       * half-filled folder reads as a thin box with a few blocks in it. */
+      .dsh-order-state svg .dsh-folder-shell {
+        fill: currentColor;
+        fill-opacity: 0.13;
+        stroke: none;
       }
 
-      .dsh-order-state .dsh-spin-arc {
+      /* The outline proper, laid over everything so a filled folder still has
+       * its edge: the app's own folder path at its own 1-unit weight, which is
+       * what makes a busy row and an idle row the same drawing at the same
+       * size. */
+      .dsh-order-state svg .dsh-folder-outline {
         fill: none;
         stroke: currentColor;
-        stroke-width: 2.5;
+        stroke-width: 1;
+        stroke-linejoin: round;
+      }
+
+      .dsh-order-state svg .dsh-folder-lip {
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1;
         stroke-linecap: round;
-        stroke-dasharray: 15 45;
-        transform-origin: 12px 12px;
-        animation: dsh-order-spin 1s linear infinite;
+        opacity: 0.65;
       }
 
-      @keyframes dsh-order-spin {
-        to { transform: rotate(360deg); }
+      /* The eight cells: four across, two down, inside the folder's front
+       * pocket. Every state lights the same eight cells and differs only in how
+       * they come and go, so a workspace never changes shape when its state
+       * changes — only its contents do. */
+      .dsh-order-state svg .dsh-folder-cell {
+        fill: currentColor;
+        stroke: none;
+        opacity: 1;
       }
 
-      @media (prefers-reduced-motion: reduce) {
-        .dsh-order-state .dsh-spin-arc {
-          animation-duration: 2.4s;
+      .dsh-order-state svg .dsh-folder-cells {
+        display: inline;
+      }
+
+      /* The pocket everything falls inside of. Bricks that leave the folder
+       * have to leave through its own edge, so the grid is clipped to the part
+       * below the lip; without this a falling brick would carry on over the row
+       * underneath. */
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cells {
+        clip-path: url(#dsh-order-pocket);
+      }
+
+      /* Green, working: a snake running laps inside the folder.
+       *
+       * It comes in at the bottom-left, travels right along the bottom, climbs
+       * the right-hand edge, comes back along the top and drops down the left —
+       * the circuit the ring of cells actually has — and it never stops, because
+       * a lap with no end is exactly what "still working" means.
+       *
+       * One animation drives all eight cells. Each cell knows its own position
+       * on the lap and starts that same animation that much earlier, so the lit
+       * window travels round the ring by itself; nothing is timed per cell.
+       *
+       * The lit window is 3/8 of the cycle — two cells at full strength and one
+       * behind them half-way. A longer gradient tail vanished into the grid at
+       * 16px and left a single blinking square; two solid cells and a fading
+       * third read as a body even at that size. */
+      .dsh-order-state[data-state="running"] svg .dsh-folder-cell {
+        opacity: 0.14;
+        animation: dsh-order-snake 2.4s linear infinite;
+        animation-delay: calc(-0.3s * var(--dsh-order-lap));
+      }
+
+      @keyframes dsh-order-snake {
+        0% { opacity: 1; }
+        12.5% { opacity: 1; }
+        24.9% { opacity: 0.72; }
+        37.4% { opacity: 0.14; }
+        100% { opacity: 0.14; }
+      }
+
+      /* Amber, waiting: the bottom row holds while the top row blinks.
+       *
+       * The steady half says "this is parked, nothing is progressing"; the
+       * blinking half says "and it is waiting on you". Slower and shallower than
+       * the green, because a wait is not a progress bar and must not read as
+       * one. */
+      .dsh-order-state[data-state="waiting"] svg .dsh-folder-cell:nth-of-type(n + 5) {
+        animation: dsh-order-blink 1.5s ease-in-out infinite;
+      }
+
+      @keyframes dsh-order-blink {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.18; }
+      }
+
+      /* Red, broken: the wall comes down.
+       *
+       * Eight bricks stand in two rows, then the whole wall drops at once. Each
+       * brick tumbles its own way — its own lean, its own sideways drift, its
+       * own pivot — so what falls is a pile of loose bricks rather than one
+       * solid plate tipping over. Nothing fades: a brick stays fully opaque
+       * until it has fallen past the folder's own bottom edge and the pocket
+       * clip takes it away, which is also why nothing is left lying at the
+       * bottom. Once the last one is gone the wall is simply standing again.
+       *
+       * The lower row has about five units to travel to clear the pocket and
+       * the upper row about nine; short travel is what leaves cut-off stubs
+       * sitting on the floor. */
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell {
+        transform-box: fill-box;
+        animation: dsh-order-wall-fall 2.8s infinite;
+      }
+
+      @keyframes dsh-order-wall-fall {
+        0%, 26% {
+          transform: translate(0, 0) rotate(0deg);
+          animation-timing-function: cubic-bezier(0.45, 0.02, 1, 0.6);
+        }
+        58%, 78% {
+          transform: translate(var(--dsh-order-fx), var(--dsh-order-fy)) rotate(var(--dsh-order-fr));
+          animation-timing-function: linear;
+        }
+        78.01%, 100% {
+          transform: translate(0, 0) rotate(0deg);
         }
       }
 
-      /*
-       * A finished session is marked with the page's own brand green, while the
-       * workspace above it wears the deepened green the badges use, so the two
-       * disagree about what "finished" looks like in one and the same column.
-       * The dot is pointed at the workspace badge's colour instead: a session
-       * still reads as a dot and a workspace still reads as a tick — which is
-       * the distinction worth keeping — but one state is now one colour. In the
-       * dark theme the two already agreed, since the badges keep the page's
-       * token there; this is what makes the light theme agree as well.
-       *
-       * Only the done state is named. The page draws a running session as a
-       * neutral spinner and an idle one as a neutral dot, so neither is green to
-       * begin with. No shadowing flag either, deliberately: the unseen-failure
-       * rule below carries one and has to keep beating this, or a session that
-       * broke would quietly go back to looking finished.
-       */
-      div[data-row-key^="session:"] [data-state="done"] {
-        color: var(--dsh-order-green);
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell:nth-of-type(1) {
+        --dsh-order-fx: -0.55px; --dsh-order-fy: 5.2px; --dsh-order-fr: 34deg;
+        transform-origin: 15% 80%;
       }
 
-      /*
-       * The Host's shared ledger drives the row dot in both directions, because
-       * the page's own store only knows what this page watched with its own
-       * eyes. A reply the ledger still calls unread lifts a plain idle dot to
-       * the same green on a client that never saw the turn end — without it, a
-       * second browser shows the workspace check but no dot on the session
-       * itself. The mirror case: this page watched the turn end and its store
-       * keeps the dot green until the session is opened *here*, even after the
-       * reply was read on another client; a retirement from the ledger returns
-       * that dot to idle. The failure rule below still outranks both.
-       */
-      .dsh-order-session-unread [data-state="idle"] {
-        color: var(--dsh-order-green) !important;
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell:nth-of-type(2) {
+        --dsh-order-fx: 0.1px; --dsh-order-fy: 5.5px; --dsh-order-fr: -21deg;
+        transform-origin: 70% 75%;
       }
 
-      .dsh-order-session-read [data-state="done"] {
-        color: var(--dsw-alias-state-idle-primary, #94a3b8) !important;
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell:nth-of-type(3) {
+        --dsh-order-fx: -0.12px; --dsh-order-fy: 5.1px; --dsh-order-fr: 28deg;
+        transform-origin: 25% 85%;
       }
 
-      /*
-       * A session row whose turn failed: the page's own status store has no idea
-       * a turn can fail, so it paints the stop as a plain completion — a green
-       * dot on a conversation that actually broke. The dot is recoloured here so
-       * the session tells the same story as the workspace above it. The colour is
-       * set rather than the dot itself, because the page paints the dot core with
-       * the current text colour. Only the failure states are touched, and only
-       * while the failure is still unseen.
-       */
-      .dsh-order-session-errored [data-state="done"],
-      .dsh-order-session-errored [data-state="idle"] {
-        color: var(--dsh-order-red) !important;
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell:nth-of-type(4) {
+        --dsh-order-fx: 0.62px; --dsh-order-fy: 5.6px; --dsh-order-fr: -37deg;
+        transform-origin: 85% 70%;
       }
 
-      /*
-       * The dot the page leaves out. The page names a dot only for a state it
-       * can name — waiting, running, or a completion this page has not read —
-       * and hands the leading cell to a plugin slot for everything else. An
-       * idle row is exactly what an unseen failure looks like from here, and
-       * also what a reply finished on another client looks like before the
-       * ledger is consulted, so in both cases there was no dot to recolour:
-       * the workspace above wore the red exclamation while the row that caused
-       * it stayed blank. This draws that dot in the cell the page reserved for
-       * it, to the page's own metrics, and stands down whenever the page does
-       * paint one so no row ever carries two.
-       */
-      .dsh-order-session-mark {
-        position: relative;
-        display: inline-block;
-        flex: none;
-        width: 10px;
-        height: 10px;
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell:nth-of-type(5) {
+        --dsh-order-fx: 0.48px; --dsh-order-fy: 8.8px; --dsh-order-fr: -26deg;
+        transform-origin: 80% 60%;
       }
 
-      .dsh-order-session-mark::after {
-        content: "";
-        position: absolute;
-        inset: 20%;
-        border-radius: 50%;
-        background: currentColor;
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell:nth-of-type(6) {
+        --dsh-order-fx: -0.6px; --dsh-order-fy: 9.1px; --dsh-order-fr: 41deg;
+        transform-origin: 18% 65%;
       }
 
-      .dsh-order-session-mark[data-mark="error"] {
-        color: var(--dsh-order-red);
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell:nth-of-type(7) {
+        --dsh-order-fx: 0.3px; --dsh-order-fy: 8.6px; --dsh-order-fr: -31deg;
+        transform-origin: 65% 55%;
       }
 
-      .dsh-order-session-mark[data-mark="done"] {
-        color: var(--dsh-order-green);
+      .dsh-order-state[data-state="error"] svg .dsh-folder-cell:nth-of-type(8) {
+        --dsh-order-fx: -0.28px; --dsh-order-fy: 9px; --dsh-order-fr: 22deg;
+        transform-origin: 35% 60%;
       }
 
-      /*
-       * The three state glyphs, as masks.
-       *
-       * A mask is the one way to change a session mark's silhouette without
-       * taking the colour away from the rules that already own it: the mark
-       * keeps painting its own currentColor, and the mask only decides which
-       * pixels survive. So the palette below, the unread lift, the failure
-       * override and the foreign "read elsewhere" retirement all go on working
-       * untouched — what changes is the shape alone.
-       *
-       * Each drawing is the workspace badge's own path, so a session and the
-       * workspace above it show literally the same glyph rather than two
-       * near-misses. Strokes are thickened relative to the badge because this
-       * one renders at 10px instead of 14px; the badge's own 2.2 and 2.6 would
-       * thin out to a hairline at that size.
-       */
+      /* Green, finished unread: all eight blocks, still. The one state that is
+       * not moving is the one that is over. */
+      .dsh-order-state[data-state="done"] svg .dsh-folder-cell {
+        opacity: 1;
+      }
+
+      .dsh-order-state[data-state="error"] svg .dsh-folder-lip,
+      .dsh-order-state[data-state="done"] svg .dsh-folder-lip {
+        display: none;
+      }
+
+      /* Motion is the whole message here, so these fall back to a still frame
+       * instead of to nothing. A still frame has to show the state, not just
+       * stop: the snake stops mid-lap, the amber keeps its steady row and drops
+       * the blinking one, the wall keeps standing, and the finished folder stays
+       * full. */
+      @media (prefers-reduced-motion: reduce) {
+        .dsh-order-state[data-state="running"] svg .dsh-folder-cell {
+          animation: none;
+          opacity: 0.14;
+        }
+
+        /* The snake stopped with its head at the bottom-left and its body
+         * trailing up the left-hand edge: a frame of the lap, not an empty
+         * folder. */
+        .dsh-order-state[data-state="running"] svg .dsh-folder-cell:nth-of-type(1) {
+          opacity: 1;
+        }
+
+        .dsh-order-state[data-state="running"] svg .dsh-folder-cell:nth-of-type(5) {
+          opacity: 1;
+        }
+
+        .dsh-order-state[data-state="running"] svg .dsh-folder-cell:nth-of-type(6) {
+          opacity: 0.72;
+        }
+
+        .dsh-order-state[data-state="waiting"] svg .dsh-folder-cell:nth-of-type(n + 5) {
+          animation: none;
+          opacity: 0.45;
+        }
+
+        .dsh-order-state[data-state="error"] svg .dsh-folder-cell {
+          animation: none;
+        }
+      }
+
+      /* One resolved state owns BOTH the shape and colour of a native dot.
+       * Never mutate React's data-state or replace its node. */
       body {
-        --dsh-order-glyph-waiting: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='none' stroke='%23000' stroke-width='3.1' stroke-linecap='round' d='M9.2 9.1a2.9 2.9 0 1 1 3.7 3.2c-.8.2-1.4 1-1.4 1.9v.5'/><circle cx='11.6' cy='18.4' r='2.3' fill='%23000'/></svg>");
-        --dsh-order-glyph-error: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='9.9' y='3.4' width='4.2' height='11.4' rx='2.1' fill='%23000'/><circle cx='12' cy='18.9' r='2.4' fill='%23000'/></svg>");
+        --dsh-order-glyph-waiting: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='none' stroke='%23000' stroke-width='3.1' stroke-linecap='round' d='M9.2 9.1a2.9 2.9 0 1 1 3.7 3.2c-.8.2-1.4 1-1.4 1.9v.5'/><circle cx='11.6' cy='20' r='2.3'/></svg>");
+        --dsh-order-glyph-running: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><path fill='none' stroke='%23000' stroke-width='3.6' stroke-linecap='round' d='M12 3.4a8.6 8.6 0 1 1-7.5 4.4'/></svg>");
+        --dsh-order-glyph-error: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect x='9.9' y='3.4' width='4.2' height='11.4' rx='2.1'/><circle cx='12' cy='19.4' r='2.4'/></svg>");
         --dsh-order-glyph-done: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><polyline points='4.2 12.6 9.4 17.8 19.8 6.2' fill='none' stroke='%23000' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'/></svg>");
       }
-
-      /*
-       * One vocabulary, two places.
-       *
-       * The page paints a session's state as a filled circle — a single
-       * ::after at 60% inset — so a row could only ever say "something green" or
-       * "something amber"; the shape that tells waiting from failed from
-       * finished lived only on the workspace row, one column over, and the two
-       * columns disagreed about what a finished session even looks like. Every
-       * meaningful state now carries the same glyph the workspace badge carries,
-       * so reading down a group reads one language:
-       *
-       *   orange ?  waiting for you    red !  broke     green ✓  finished
-       *   green spinner  working       faint dot  idle
-       *
-       * Idle is left as the page's own faint dot: a workspace shows nothing at
-       * all when idle, and a row that vanished entirely would lose the leading
-       * rhythm the whole list is built on.
-       *
-       * The selectors name every path a mark can arrive by — the page's own
-       * dot, the plugin's fallback mark, an unread dot lifted by the shared
-       * ledger, and a dot the failure rule took over — because a mark that
-       * changed shape only on some of those paths would be worse than none.
-       */
-      div[data-row-key^="session:"] [data-state="warning"]::after,
-      div[data-row-key^="session:"] [data-state="error"]::after,
-      div[data-row-key^="session:"] [data-state="done"]::after,
-      div[data-row-key^="session:"] [data-state="ongoing"]::after,
-      div[data-row-key^="session:"].dsh-order-session-unread [data-state="idle"]::after,
-      div[data-row-key^="session:"].dsh-order-session-errored [data-state="done"]::after,
-      div[data-row-key^="session:"].dsh-order-session-errored [data-state="idle"]::after,
-      .dsh-order-session-mark::after {
-        inset: 0;
-        border-radius: 0;
-        background: currentColor;
-        -webkit-mask-repeat: no-repeat;
-        mask-repeat: no-repeat;
-        -webkit-mask-position: center;
-        mask-position: center;
-        -webkit-mask-size: contain;
-        mask-size: contain;
+      .dsh-order-session-mark { position:relative; display:inline-block; flex:none; width:10px; height:10px; }
+      [data-dsh-order-state="waiting"] { color:var(--dsh-order-amber) !important; --dsh-order-mask:var(--dsh-order-glyph-waiting); }
+      [data-dsh-order-state="error"] { color:var(--dsh-order-red) !important; --dsh-order-mask:var(--dsh-order-glyph-error); }
+      [data-dsh-order-state="running"], [data-dsh-order-state="done"] { color:var(--dsh-order-green) !important; }
+      [data-dsh-order-state="running"] { --dsh-order-mask:var(--dsh-order-glyph-running); }
+      [data-dsh-order-state="done"] { --dsh-order-mask:var(--dsh-order-glyph-done); }
+      [data-dsh-order-state="idle"] { color:var(--dsw-alias-state-idle-primary,#94a3b8) !important; }
+      /* SVG cannot reliably generate ::after boxes. Its owned HTML replacement
+       * keeps the leading-cell geometry; the React SVG and its paths stay put. */
+      .dsh-order-native-svg-hidden { display:none !important; animation:none !important; }
+      .dsh-order-native-svg-hidden * { animation:none !important; }
+      .dsh-order-native-mark:not(svg)[data-dsh-order-state]::after, .dsh-order-session-mark::after {
+        content:""; position:absolute; inset:0; border:0 !important; border-radius:0;
+        background:currentColor; animation:none !important; transform:none;
+        -webkit-mask:var(--dsh-order-mask) center / contain no-repeat;
+        mask:var(--dsh-order-mask) center / contain no-repeat;
       }
-
-      div[data-row-key^="session:"] [data-state="warning"]::after,
-      .dsh-order-session-mark[data-mark="waiting"]::after {
-        -webkit-mask-image: var(--dsh-order-glyph-waiting);
-        mask-image: var(--dsh-order-glyph-waiting);
+      .dsh-order-native-mark:not(svg)[data-dsh-order-state="idle"]::after,
+      .dsh-order-session-mark[data-dsh-order-state="idle"]::after {
+        inset:20%; border-radius:50%; -webkit-mask:none; mask:none;
       }
-
-      div[data-row-key^="session:"] [data-state="error"]::after,
-      div[data-row-key^="session:"].dsh-order-session-errored [data-state="done"]::after,
-      div[data-row-key^="session:"].dsh-order-session-errored [data-state="idle"]::after,
-      .dsh-order-session-mark[data-mark="error"]::after {
-        -webkit-mask-image: var(--dsh-order-glyph-error);
-        mask-image: var(--dsh-order-glyph-error);
-      }
-
-      div[data-row-key^="session:"] [data-state="done"]::after,
-      div[data-row-key^="session:"].dsh-order-session-unread [data-state="idle"]::after,
-      .dsh-order-session-mark[data-mark="done"]::after {
-        -webkit-mask-image: var(--dsh-order-glyph-done);
-        mask-image: var(--dsh-order-glyph-done);
-      }
-
-      /*
-       * Working: the page draws that spinner in the same neutral grey it gives
-       * every inert glyph, which reads as "nothing is happening" on a row that
-       * is in fact the only one doing anything. The workspace badge above it
-       * already spins in the running green; this points the row's spinner at the
-       * very same token, so one turn in progress is one colour from the header
-       * down. Only the colour moves — the page keeps its geometry, its dash
-       * animation and its reduced-motion fallback.
-       */
-      div[data-row-key^="session:"] [data-state="ongoing"] {
-        color: var(--dsh-order-green);
+      .dsh-order-native-mark:not(svg)[data-dsh-order-state]::before { display:none !important; }
+      .dsh-order-native-mark:not(svg)[data-dsh-order-state="running"]::after,
+      .dsh-order-session-mark[data-dsh-order-state="running"]::after { animation:dsh-order-mark-spin 1.1s linear infinite !important; }
+      @keyframes dsh-order-mark-spin { to { transform:rotate(360deg); } }
+      .dsh-order-pin-btn:focus-visible, .dsh-order-star:focus-visible { opacity:1; outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary)); outline-offset:-2px; }
+      .dsh-order-star-menu-item:focus-visible { outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary)); outline-offset:-2px; }
+      .dsh-order-star-menu-item[aria-disabled="true"] { color:var(--dsw-alias-label-secondary); }
+      .dsh-order-action-feedback { flex:1 1 100%; font-size:12px; line-height:1.5; color:var(--dsh-order-red); user-select:text; white-space:normal; }
+      [data-row-key]:has(> .dsh-order-action-feedback) { flex-wrap:wrap; }
+      .dsh-order-star-menu-feedback { margin:2px 10px 6px; font-size:12px; line-height:1.5; color:var(--dsw-alias-label-secondary); user-select:text; }
+      .dsh-order-star-menu { min-width:min(240px,calc(100vw - 16px)); max-width:min(320px,calc(100vw - 16px)); }
+      .dsh-order-star-menu-item { min-height:28px; }
+      .dsh-order-star-menu:focus-visible, .dsh-order-star-menu-action:focus-visible { outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary)); outline-offset:-2px; }
+      .dsh-order-star-menu-action, .dsh-order-star-menu-archive-action { margin:0 10px 6px; border:0; border-radius:4px; background:transparent; color:var(--dsw-alias-state-business-primary); cursor:pointer; padding:4px; }
+      .dsh-order-star-menu-archive { position:sticky; bottom:-4px; background:var(--dsw-alias-bg-layer-3,#2b2b2b); border-top:1px solid var(--dsw-alias-border-l4); padding-top:4px; }
+      .dsh-order-star-menu-archive-note { margin:2px 10px 6px; font-size:12px; line-height:1.5; color:var(--dsw-alias-label-secondary); white-space:normal; user-select:text; }
+      .dsh-order-star-menu-archive-action { min-height:28px; }
+      .dsh-order-star-menu-archive-action:disabled { color:var(--dsw-alias-label-secondary); cursor:default; }
+      .dsh-order-star-menu-archive-action:focus-visible { outline:2px solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary)); outline-offset:-2px; }
+      @media (prefers-reduced-motion:reduce) {
+        .dsh-order-pin-btn, .dsh-order-star { transition:none; transform:none !important; }
+        .dsh-order-native-mark:not(svg)[data-dsh-order-state="running"]::after,
+        .dsh-order-session-mark[data-dsh-order-state="running"]::after { animation:none !important; }
+        body.dsh-order-sessions-first [data-row-key] { animation:none; transition:none; }
       }
     `;
 
@@ -619,32 +755,93 @@ window.__ModuleLoader__.load({
       </svg>
     `;
 
-    const SPINNER_SVG = `
-      <svg viewBox="0 0 24 24" aria-hidden="true">
-        <circle class="dsh-spin-track" cx="12" cy="12" r="9.5"></circle>
-        <circle class="dsh-spin-arc" cx="12" cy="12" r="9.5"></circle>
-      </svg>
-    `;
+    /*
+     * The workspace badge is the app's own folder icon, redrawn rather than
+     * reused.
+     *
+     * The path below is copied verbatim from the folder the sidebar paints on
+     * an idle workspace row (same 16-unit box, same 1-unit stroke, same tab and
+     * same lip across the front). Reusing the drawing is what lets a workspace
+     * that has something to say sit in the list without looking like a
+     * different kind of row: the silhouette is the one the eye already knows.
+     *
+     * What the app's icon has not got is an interior, and the interior is where
+     * this badge speaks. Eight blocks are laid into the front panel — four
+     * across, two down — and every state draws those same eight blocks; only
+     * what they do differs. A workspace therefore never changes shape when its
+     * state changes, and the four states read as four conditions of one object
+     * rather than four different icons.
+     *
+     * Cell 0 sits bottom-left, cell 3 bottom-right, cell 4 top-left, cell 7
+     * top-right. The snake is the only state that cares about that order.
+     */
+    const FOLDER_PATH = 'M1.50439 3.11059C1.50439 2.55831 1.95211 2.1106 2.50439 2.1106H5.43389C5.67773 2.1106 5.91318 2.19969 6.09593 2.36113L7.71649 3.79265C7.89924 3.95409 8.1347 4.04319 8.3785 4.04319H13.4958C14.0481 4.04319 14.4958 4.4909 14.4958 5.04319V12.8894C14.4958 13.4417 14.0481 13.8894 13.4958 13.8894H2.50439C1.95211 13.8894 1.50439 13.4417 1.50439 12.8894V4.04319V3.11059Z';
+    const FOLDER_LIP = 'M3.63501 7.66614H12.3647';
+    const BADGE_CLIP_ID = 'dsh-order-pocket';
 
-    const QUESTION_SVG = `
-      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-        <path fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" d="M9.2 9.1a2.9 2.9 0 1 1 3.7 3.2c-.8.2-1.4 1-1.4 1.9v.5"></path>
-        <circle cx="11.6" cy="18.4" r="1.4"></circle>
-      </svg>
-    `;
+    /**
+     * The pocket: the folder's front panel, below the lip and inset by half the
+     * outline's stroke. It is both the region the bricks stand in and the hole
+     * they fall through.
+     */
+    const FOLDER_POCKET = 'M2.00439 8.16614H13.9958V12.8894C13.9958 13.1655 13.7719 13.3894 13.4958 13.3894H2.50439C2.22825 13.3894 2.00439 13.1655 2.00439 12.8894Z';
 
-    const CHECK_SVG = `
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <polyline points="4.5 12.5 9.5 17.5 19.5 6.5"></polyline>
-      </svg>
-    `;
+    /** Cells inside the front panel: 4 across, 2 down, in fill order. */
+    const FOLDER_CELLS = (() => {
+      const left = 2.7;
+      const top = 8.28;
+      const size = 2.2;
+      const gapX = 0.6;
+      const gapY = 0.6;
+      const cells = [];
+      // Bottom row first (y grows downward, so the bottom row is the larger y),
+      // left to right; then the row above it.
+      for (let row = 1; row >= 0; row -= 1) {
+        for (let col = 0; col < 4; col += 1) {
+          cells.push({
+            x: left + col * (size + gapX),
+            y: top + row * (size + gapY)
+          });
+        }
+      }
+      // The lap the working snake runs: in at the bottom-left, right along the
+      // bottom, up the right-hand side, back along the top and down the left,
+      // which is the one circuit a ring of cells this shape actually has. Lap
+      // positions are handed out in reverse so that "one step later" is always
+      // one step further round in this direction — the badge's single animation
+      // drives all eight cells by delay alone, and a delay can only run one way.
+      const lapOrder = [0, 1, 2, 3, 7, 6, 5, 4];
+      const lapPosition = new Array(8);
+      lapOrder.forEach((cellIndex, step) => {
+        // Each cell starts the lap animation a step earlier than the one behind
+        // it, and a negative delay is how a cell is put *forward* in its own
+        // timeline. Counting the steps backwards is what makes the head travel
+        // lapOrder forwards: left to right along the bottom first, which is the
+        // way the snake is meant to come in.
+        lapPosition[cellIndex] = lapOrder.length - 1 - step;
+      });
 
-    const ALERT_SVG = `
-      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-        <rect x="10.2" y="4.2" width="3.6" height="10.4" rx="1.8"></rect>
-        <circle cx="12" cy="18.6" r="2"></circle>
+      return cells.map(({ x, y }, index) => (
+        `<rect class="dsh-folder-cell" style="--dsh-order-lap:${lapPosition[index]}" x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${size}" height="${size}" rx="0.35"></rect>`
+      )).join('');
+    })();
+
+    /**
+     * One folder badge. Every state draws the same folder and the same eight
+     * blocks; the stylesheet decides what they do. Nothing here is
+     * state-specific, so switching state never rewrites the drawing — only the
+     * rules that paint it.
+     */
+    function folderSvg() {
+      return `
+      <svg viewBox="0 0 16 16" aria-hidden="true">
+        <path class="dsh-folder-shell" d="${FOLDER_PATH}"></path>
+        <g class="dsh-folder-cells">${FOLDER_CELLS}</g>
+        <path class="dsh-folder-outline" d="${FOLDER_PATH}"></path>
+        <path class="dsh-folder-lip" d="${FOLDER_LIP}"></path>
       </svg>
     `;
+    }
 
     /** Feature switches; kept in step with the Host through the status poll. */
     const SETTINGS_DEFAULT = {
@@ -713,7 +910,7 @@ window.__ModuleLoader__.load({
     let hostError = '';
     // The panel store carries both facts: the switches and where they persisted,
     // so a change to either repaints the card.
-    const settingsStore = uiAvailable ? createStore({ settings, hostAccepted, hostError }) : null;
+    const settingsStore = uiAvailable ? createLocalStore({ settings, hostAccepted, hostError }) : null;
 
     /** All switches, so the summary and persistence cover every one. */
     const SETTING_ROWS = [
@@ -751,6 +948,102 @@ window.__ModuleLoader__.load({
       .dsh-order-panel-group { margin-top: 4px; }
       .dsh-order-panel-group-body { padding-left: 20px; }
       .dsh-order-panel-group-tag { margin-left: 8px; flex-shrink: 0; }
+
+      /*
+       * The card's own switch, tag and disclosure row. These copy the shipped
+       * primitives' measurements and states (36x20 track, 16px thumb, 999px
+       * radius, focus ring at 2px offset) but read only the host's
+       * --dsw-alias-* theme tokens, so a renamed token degrades the look
+       * instead of breaking the control, and nothing depends on a private
+       * module's exports.
+       */
+      .dsh-order-panel-switch {
+        box-sizing: border-box;
+        position: relative;
+        flex: 0 0 auto;
+        width: 36px;
+        height: 20px;
+        padding: 2px;
+        border: 0;
+        border-radius: 999px;
+        background: var(--dsw-alias-border-l3, rgba(255, 255, 255, 0.2));
+        cursor: pointer;
+        transition: background 0.12s ease;
+      }
+      .dsh-order-panel-switch[aria-checked="true"] { background: var(--dsw-alias-brand-primary, #5285ff); }
+      .dsh-order-panel-switch:disabled { cursor: default; opacity: 0.5; }
+      .dsh-order-panel-switch:focus-visible {
+        outline: var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary, #5285ff));
+        outline-offset: 2px;
+      }
+      .dsh-order-panel-switch-thumb {
+        display: block;
+        width: 16px;
+        height: 16px;
+        border-radius: 50%;
+        background: var(--dsw-alias-label-primary-foreground, #fff);
+        transition: transform 0.12s ease;
+      }
+      .dsh-order-panel-switch[aria-checked="false"] .dsh-order-panel-switch-thumb {
+        background: var(--dsw-alias-switch-thumb, rgba(255, 255, 255, 0.7));
+      }
+      .dsh-order-panel-switch[aria-checked="true"] .dsh-order-panel-switch-thumb { transform: translate(16px); }
+
+      .dsh-order-panel-group-tag {
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: 1px 8px;
+        font-size: 11px;
+        line-height: 17px;
+        font-weight: 500;
+        white-space: nowrap;
+      }
+      .dsh-order-panel-group-tag[data-tone="quiet"] { color: var(--dsw-alias-label-tertiary, rgba(255, 255, 255, 0.45)); }
+      .dsh-order-panel-group-tag[data-tone="warning"] {
+        background: color-mix(in srgb, var(--dsh-order-amber) 12%, transparent);
+        color: var(--dsh-order-amber);
+      }
+      .dsh-order-panel-group-tag[data-tone="success"] {
+        background: color-mix(in srgb, var(--dsw-alias-state-success-primary, #22c55e) 12%, transparent);
+        color: var(--dsw-alias-state-success-primary, #22c55e);
+      }
+
+      .dsh-order-panel-group-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 32px;
+        cursor: pointer;
+        user-select: none;
+      }
+      .dsh-order-panel-group-header:focus-visible {
+        outline: var(--dsw-focus-ring-width, 2px) solid var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary, #5285ff));
+        outline-offset: 2px;
+        border-radius: var(--dsw-radius-sm, 8px);
+      }
+      .dsh-order-panel-group-title {
+        font-size: 13px;
+        font-weight: 500;
+        color: var(--dsw-alias-label-primary, rgba(255, 255, 255, 0.92));
+      }
+      .dsh-order-panel-chevron {
+        width: 0;
+        height: 0;
+        flex: 0 0 auto;
+        border-left: 4px solid currentColor;
+        border-top: 4px solid transparent;
+        border-bottom: 4px solid transparent;
+        color: var(--dsw-alias-label-tertiary, rgba(255, 255, 255, 0.45));
+        transition: transform 0.12s ease;
+        transform: rotate(0deg);
+      }
+      .dsh-order-panel-chevron[data-open="true"] { transform: rotate(90deg); }
+      @media (prefers-reduced-motion: reduce) {
+        .dsh-order-panel-chevron,
+        .dsh-order-panel-switch,
+        .dsh-order-panel-switch-thumb { transition: none; }
+      }
       /*
        * An expanded workspace reads as a recessed tray: its header row and the
        * sessions it reveals share one sunken surface, so the open group stands
@@ -806,41 +1099,11 @@ window.__ModuleLoader__.load({
         opacity: 0.88;
       }
 
-      /*
-       * Tree view ordering: own sessions first, sub-workspaces below.
-       *
-       * Under tree view (groupBy === 'workspace-tree') the page lists a
-       * workspace's nested sub-workspaces ABOVE its own sessions, so the
-       * sessions end up pressed against the last child workspace and read as
-       * if they belonged to it.
-       *
-       * The whole fix is one move: the child-workspace block is pushed to the
-       * end of its parent, and everything else is left exactly where the page
-       * put it. That is deliberate. The page wraps each row in its own span, so
-       * matching "rows" directly would mean depending on an internal wrapper
-       * tag that has already changed once and can change again; this rule only
-       * names the one element that carries a meaning the page commits to — the
-       * role="group" block holding the nested workspaces. With that block
-       * moved last, the workspace header, its own sessions and its "show more"
-       * button all keep their native order, which is already header → sessions
-       * → overflow.
-       *
-       * The wrapper span around every row is deliberately NOT used as an anchor:
-       * it is an internal implementation detail that already changed once.
-       *
-       * Flex reordering leaves the DOM alone, so React reconciliation, the
-       * page's drag-and-drop, keyboard focus and selection are untouched: only
-       * the painted order changes.
-       */
-      body.dsh-order-sessions-first div[class*="groupSection"] {
-        display: flex;
-        flex-direction: column;
-      }
-
-      body.dsh-order-sessions-first div[class*="groupSection"] > [role="group"] {
-        order: 1;
-        margin-top: 4px;
-      }
+      /* Own sessions and overflow precede nested groups. React nodes stay put.
+       * Keyboard traversal uses this same semantic order; reading-flow is an
+       * additional progressive enhancement, not our keyboard implementation. */
+      body.dsh-order-sessions-first div[class*="groupSection"] { display:flex; flex-direction:column; reading-flow:flex-visual; }
+      body.dsh-order-sessions-first div[class*="groupSection"] > [role="group"] { order:1; margin-top:4px; }
 
       /*
        * The box wraps one whole group: its workspace row plus the sessions it
@@ -852,40 +1115,11 @@ window.__ModuleLoader__.load({
         border-radius: var(--dsw-radius-lg, 16px);
       }
 
-      /*
-       * A nested workspace steps its whole block right, one step per level, so
-       * a level's shaded tray starts under that level's own folder icon instead
-       * of every level sharing one left edge. The step is the page's own indent
-       * unit (12px), the same one the folder and the title use, so the box and
-       * the content inside it always begin on the same column.
-       *
-       * Nesting is read from the page's own group class rather than from a class
-       * this plugin adds: a collapsed child draws no tray of its own, but it is
-       * still laid out inside the shifted parent and has to move with it.
-       *
-       * The right edge is deliberately left alone. Pulling it in as well would
-       * narrow the box from both sides and cost every deeper level the room its
-       * long workspace names need.
-       */
-      div[class*="groupSection"] div[class*="groupSection"] {
-        margin-left: 12px;
-      }
-
-      /*
-       * The step is taken by the box, so the rows give their own indent back.
-       * A row that kept its full indent inside a shifted box would sit one step
-       * too far right, and the folder, title, pin and badge would all drift.
-       * With the indent returned, a row lands exactly where it did before the
-       * box moved. The "show more" button is excluded here and realigned below,
-       * since its own padding carries the same indent.
-       */
-      div[class*="groupSection"] div[class*="groupSection"] > [data-row-key]:not([data-row-key^="overflow:"]) {
-        padding-inline-start: 8px !important;
-      }
-
-      div[class*="groupSection"] div[class*="groupSection"] > [class*="sessionOverflowButton"] {
-        padding-left: 28px !important;
-      }
+      /* The tray owns the one 12px step. Mark actual row ownership by closest
+       * groupSection, independent of any direct or multi-level HoverCard wrapper.
+       * Keep native base padding, border inset and overflow padding unchanged. */
+      body.dsh-order-tree-trays div[class*="groupSection"] div[class*="groupSection"] { margin-inline-start:12px; }
+      body.dsh-order-tree-trays [data-dsh-order-tray-row] { --dsh-workspace-indent:0px; }
 
       .dsh-order-panel-note { font-size: 12px; color: var(--dsw-alias-label-tertiary, rgba(255, 255, 255, 0.45)); padding-top: 8px; }
       .dsh-order-panel-error { font-size: 12px; color: var(--dsh-order-red); padding-top: 8px; }
@@ -914,10 +1148,10 @@ window.__ModuleLoader__.load({
 
     /** Badge metadata per state, in display priority order. */
     const STATES = {
-      waiting: { svg: QUESTION_SVG, title: '等你回答或确认…' },
-      error: { svg: ALERT_SVG, title: '有会话异常中断，点击查看' },
-      running: { svg: SPINNER_SVG, title: '正在工作中…' },
-      done: { svg: CHECK_SVG, title: '已完成，有新的回复未看' }
+      waiting: { svg: folderSvg(), key: 'state.waiting' },
+      error: { svg: folderSvg(), key: 'state.error' },
+      running: { svg: folderSvg(), key: 'state.running' },
+      done: { svg: folderSvg(), key: 'state.done' }
     };
 
     let pinnedSet = new Set();
@@ -934,6 +1168,19 @@ window.__ModuleLoader__.load({
     let erroredSessionSet = new Set();
     /** workspaceId -> true when one of its sessions waits for an answer. */
     let waitingSet = new Set();
+    /**
+     * The same fact per session, so a rendered row can wear the question in the
+     * leading cell when the page paints nothing there — which, in this build,
+     * is every row that is not mid-turn.
+     */
+    let waitingSessionSet = new Set();
+    /**
+     * Root sessions with work in progress, from the Host poll. The page's own
+     * live store only covers sessions it has bound, and a row behind a live
+     * store that has not settled yet would otherwise show nothing while its
+     * workspace above spins.
+     */
+    let runningSessionSet = new Set();
     /** workspaceId -> true when one of its sessions finished with an unread reply. */
     let unreadSet = new Set();
     /** The same fact per session, so the reply being read can be excluded. */
@@ -959,19 +1206,14 @@ window.__ModuleLoader__.load({
     /** Session ids whose failure this page witnessed, cleared once the user opens them. */
     const clientErrored = new Set();
 
-    /**
-     * When this page's own store first claimed "finished unread" for a session:
-     * sessionId -> timestamp. The local store is per-browser: it only ever saw
-     * the turns that ended in front of this page, and nothing can retract an
-     * entry from another client. Pairing the timestamp with the Host's poll
-     * clock is what makes retraction possible anyway — a Host reply that
-     * arrived *after* the local sighting and still does not list the session
-     * as unread means the reply was read somewhere else, and the local green
-     * must go. Without a poll newer than the sighting, the local store stays
-     * trusted, so a completion can never blink out during a Host outage or in
-     * the gap before the next poll.
-     */
-    const localUnreadSeenAt = new Map();
+    // Completion is Host-confirmed, never inferred from a native stop. A read
+    // retirement or a new run invalidates the old affirmation. Only a matching
+    // post-run Host snapshot can confirm another successful unread completion.
+    const retiredLocalUnread = new Set();
+    let archivedSessionSet = new Set();
+    let archivedSessionsKnown = false;
+    let hostSessionTitles = Object.create(null);
+    let sessionTitlesKnown = false;
 
     /** Wall clock of the last successful Host status poll; 0 before the first. */
     let lastStatusAt = 0;
@@ -984,32 +1226,62 @@ window.__ModuleLoader__.load({
       return lastStatusAt > 0 && Date.now() - lastStatusAt < HOST_FRESH_MS;
     }
 
-    /**
-     * Whether this page's own "finished unread" claim still counts, or the
-     * Host's shared ledger has since retired it (the reply was opened on
-     * another client). Called from the render path, so the sighting clock is
-     * maintained here for every session the live store reports.
-     */
+    /** One Host-confirmed unread predicate shared by native dots, fallback
+     * glyphs and workspace roll-ups, including during connection outages. */
     function localDoneCounts(sessionId) {
-      const seenAt = localUnreadSeenAt.get(sessionId);
-      if (unreadSessionSet.has(sessionId)) {
-        // The ledger agrees the reply is unread; start the comparison clock
-        // from the agreement, so its retirement can take effect on the very
-        // next poll instead of one poll after that.
-        if (seenAt === undefined) localUnreadSeenAt.set(sessionId, Date.now());
-        return true;
+      // Native completionUnread includes cancelled/blocked/no-reply stops. It
+      // is never proof of successful completion. Only an accepted exact Host
+      // affirmation counts; a connection outage preserves that existing fact.
+      return unreadSessionSet.has(sessionId) && !retiredLocalUnread.has(sessionId);
+    }
+    const unreadEpochs = new Map();
+    let lastRunSignals = new Map();
+    let activeUnreadRoots = new Set();
+    function invalidateUnread(root, source = root) {
+      unreadEpochs.set(root, (unreadEpochs.get(root) || 0) + 1);
+      for (const id of new Set([root, source])) {
+        unreadSessionSet.delete(id); retiredLocalUnread.add(id);
       }
-      // A sighting this page has not recorded yet cannot be compared against
-      // the poll clock; trust the local store and start the clock now.
-      if (seenAt === undefined) {
-        localUnreadSeenAt.set(sessionId, Date.now());
-        return true;
+    }
+    function observeRunSignals() {
+      const statuses = statusSnapshot(), list = sessionListSnapshot(), byId = list.byId || {};
+      const parents = subagentParentsOf(byId, list.projectionsBySession);
+      const next = new Map(), active = new Set();
+      const consider = (kind, id, running) => {
+        const key = `${kind}:${id}`, root = rootSessionIdOf(id, parents);
+        next.set(key, running);
+        if (!running) return;
+        active.add(root);
+        // Track each source independently: a rapid second run may start while
+        // another source still paints its old ongoing SVG.
+        if (lastRunSignals.get(key) !== true) invalidateUnread(root, id);
+      };
+      for (const [id, value] of statuses) consider('status', id, value?.running === true);
+      for (const [id, value] of Object.entries(byId)) consider('summary', id, value?.running === true);
+      for (const row of document.querySelectorAll('div[data-row-key^="session:"]')) consider('dom', row.getAttribute('data-row-key').slice(8), pageStatusDot(row)?.getAttribute('data-state') === 'ongoing');
+      lastRunSignals = next; activeUnreadRoots = active;
+    }
+    function unreadPollCut() {
+      observeRunSignals();
+      return { epochs:new Map(unreadEpochs), running:new Set(activeUnreadRoots) };
+    }
+    function applyUnreadSnapshot(ids, cut) {
+      if (!Array.isArray(ids)) { sessionMarksKnown = null; return; }
+      observeRunSignals();
+      sessionMarksKnown = true;
+      const listed = new Set(ids), next = new Set(unreadSessionSet);
+      const viewed = document.hidden ? null : computeMainSessionId() || currentSessionIdFromDom();
+      for (const id of new Set([...next, ...listed])) {
+        const sameEpoch = (cut.epochs.get(id) || 0) === (unreadEpochs.get(id) || 0);
+        if (!sameEpoch || cut.running.has(id) || activeUnreadRoots.has(id) || id === viewed || !listed.has(id)) {
+          next.delete(id); retiredLocalUnread.add(id); continue;
+        }
+        next.add(id); retiredLocalUnread.delete(id);
       }
-      // Only a Host that actually enumerated its per-session marks may retire
-      // a local sighting; a Host that predates the list says nothing about it.
-      if (sessionMarksKnown !== true) return true;
-      if (!hostFresh() || lastStatusAt < seenAt) return true;
-      return false;
+      unreadSessionSet = next;
+    }
+    function computeMainSessionId() {
+      return Object.values(sessionListSnapshot().byId || {}).find(row => (row?.retainedBy?.mainView || 0) > 0)?.id;
     }
 
     const FAVORITES_STORAGE_KEY = 'dsh-workspace-focus-enhancer:favorites';
@@ -1055,16 +1327,39 @@ window.__ModuleLoader__.load({
     let pinTask = Promise.resolve();
     let pinsEpoch = 0;
 
-    /** Live Host status store, when this page exposes it. */
-    let live = null;
-    /** Root client context, kept so the live store can bind after the Host publishes it. */
+    /** Each service has an independent Cordis injection lifetime. */
+    const live = { status:null, workspaces:null, sessions:null, uiWorkspace:null, locale:null };
     let rootCtx = null;
-    let unsubscribeLive = null;
-    /** True while a bind attempt is in flight, so a subscriber cannot re-enter it. */
-    let liveBinding = false;
-    /** One report is enough; a page that never binds must not flood the console. */
-    let liveBindWarned = false;
+    let liveBindingsInstalled = false;
     let workspaceView = null;
+
+    function snapshotOf(source, fallback) {
+      try { return source?.getSnapshot?.() ?? fallback; } catch { return fallback; }
+    }
+    function sessionListSnapshot() { return snapshotOf(live.sessions?.list, { byId:{}, projectionsBySession:{} }); }
+    function workspaceListSnapshot() { return snapshotOf(live.workspaces?.list, { items:[] }); }
+    function statusSnapshot() {
+      const value = snapshotOf(live.status, null);
+      return value instanceof Map ? value : new Map();
+    }
+    function text(key, vars = {}) {
+      let value;
+      try { value = live.locale?.bind?.('plugins.workspace-order')(key, vars); } catch {}
+      if (!value || value === key) {
+        const lang = /^zh/i.test(document.documentElement?.lang || navigator.language || 'zh') ? 'zh' : 'en';
+        value = PANEL_LOCALE[lang][key] || PANEL_LOCALE.en[key] || key;
+      }
+      return String(value).replace(/\{(\w+)\}/g, (_, name) => String(vars[name] ?? `{${name}}`));
+    }
+    function nativeText(key) {
+      try {
+        const value = live.locale?.bind?.('workspace')(key);
+        if (value && value !== key) return value;
+      } catch {}
+      const fallback = { 'session.new':'native.new', 'session.untitled':'native.untitled',
+        'toast.archivedNotOpenable':'native.archivedGuard', 'menu.unarchiveSession':'native.unarchive' };
+      return text(fallback[key] || key);
+    }
 
     /** The official view store knows whether directory nesting is actually on. */
     function usesWorkspaceTree() {
@@ -1109,72 +1404,35 @@ window.__ModuleLoader__.load({
       });
     }
 
-    /**
-     * Resolve the browser-side services that already know which session is
-     * running, which waits for the user, and which finished unread. Safe to
-     * call repeatedly until it binds: the Host may publish them after us.
-     *
-     * A partial bind is rolled back rather than kept: services can appear one at
-     * a time, and a half-attached store would leave subscriptions behind on every
-     * retry while still showing nothing.
-     */
+    /** Cordis re-runs each injection when its service starts/replaces and unwinds
+     * its child effect when it stops. No all-or-nothing bind or leaked retries. */
     function attachLiveStatus(ctx) {
-      if (disposed || live || liveBinding) return;
-      liveBinding = true;
-      const unsubscribers = [];
-      const release = () => {
-        for (const off of unsubscribers.splice(0)) {
-          try { if (typeof off === 'function') off(); } catch {}
-        }
-      };
-      try {
-        const reflect = ctx && (ctx.reflect || null);
-        const read = (name) => {
-          if (reflect && typeof reflect.get === 'function') {
-            try { return reflect.get(name); } catch { return void 0; }
-          }
-          return void 0;
-        };
-        const uiSession = read('uiSession');
-        const workspaces = read('workspaces');
-        const sessions = read('sessions');
-        // The page's own workspace service owns "open this session", including
-        // expanding whatever group holds it.
-        const uiWorkspace = read('uiWorkspace');
-        const status = uiSession && uiSession.sessionStatus;
-        if (!status || typeof status.getSnapshot !== 'function' || !workspaces || !sessions) return;
-        const changed = () => refresh();
-        if (typeof status.subscribe === 'function') unsubscribers.push(status.subscribe(changed));
-        if (typeof workspaces.list?.subscribe === 'function') unsubscribers.push(workspaces.list.subscribe(changed));
-        if (typeof sessions.list?.subscribe === 'function') unsubscribers.push(sessions.list.subscribe(changed));
-        // The Host forwards a session's turn failure over the wire; mirror it here
-        // so the red mark works even when the ordering service predates this feature.
-        const remote = read('remote');
-        if (remote && typeof remote.$on === 'function') {
-          try {
-            const offError = remote.$on('api-session/error', (sessionId) => {
+      if (disposed || liveBindingsInstalled || typeof ctx?.inject !== 'function') return;
+      liveBindingsInstalled = true;
+      for (const name of ['uiSession', 'workspaces', 'sessions', 'uiWorkspace', 'remote', 'locale']) {
+        ctx.inject([name], child => {
+          if (disposed) return;
+          const service = child[name];
+          const key = name === 'uiSession' ? 'status' : name;
+          const value = name === 'uiSession' ? service?.sessionStatus : service;
+          live[key] = value;
+          const offs = [];
+          const source = name === 'uiSession' ? value : name === 'locale' ? service?.state : service?.list;
+          if (typeof source?.subscribe === 'function') offs.push(source.subscribe(refresh));
+          if (name === 'remote' && typeof service?.$on === 'function') {
+            offs.push(service.$on('api-session/error', sessionId => {
               if (disposed) return;
               clientErrored.add(sessionId);
               refresh();
-            });
-            if (typeof offError === 'function') unsubscribers.push(offError);
-          } catch {}
-        }
-        live = { status, workspaces, sessions, uiWorkspace };
-        unsubscribeLive = release;
-        refresh();
-      } catch (err) {
-        // Release before giving up, or each retry would add another set of
-        // subscriptions on top of the ones already listening.
-        release();
-        unsubscribeLive = null;
-        live = null;
-        if (!liveBindWarned) {
-          liveBindWarned = true;
-          console.warn('[workspace-order] 页面状态服务暂时接不上，先用主机轮询显示状态:', err);
-        }
-      } finally {
-        liveBinding = false;
+            }));
+          }
+          child.effect(() => () => {
+            for (const off of offs) { try { if (typeof off === 'function') off(); } catch {} }
+            if (live[key] === value) live[key] = null;
+            if (!disposed) refresh();
+          });
+          refresh();
+        });
       }
     }
 
@@ -1286,18 +1544,10 @@ window.__ModuleLoader__.load({
      * @returns a set of workspace ids.
      */
     function unreadWorkspaces(viewedId) {
-      // The per-session list is authoritative once the Host enumerates it: with
-      // it, the reply on screen can be excluded exactly, and a check the Host
-      // already retired in this cycle cannot come back from the workspace list.
-      if (sessionMarksKnown && !unreadSessionSet.size) {
-        if (Object.keys(workspaceOfSession).length) return new Set();
-      }
-      if (!unreadSessionSet.size || !Object.keys(workspaceOfSession).length) return unreadSet;
-      const out = new Set();
+      const out = new Set(), rows = workspaceListSnapshot().items || [];
       for (const sessionId of unreadSessionSet) {
-        // The reply already in front of the user is not a new one.
-        if (sessionId === viewedId) continue;
-        const owner = workspaceOfSession[sessionId];
+        if (sessionId === viewedId || isSessionArchived(sessionId) || !localDoneCounts(sessionId)) continue;
+        const owner = workspaceOfSession[sessionId] || rows.find(row => row.sessionIds?.includes(sessionId))?.workspaceId;
         if (owner) out.add(owner);
       }
       return out;
@@ -1401,7 +1651,6 @@ window.__ModuleLoader__.load({
         // on a workspace that was in fact still being worked on.
         if (busyRoots && busyRoots.has(id)) {
           running = true;
-          localUnreadSeenAt.delete(id);
         }
         const status = statuses.get(id);
         if (status?.running === true) clientErrored.delete(id);
@@ -1412,7 +1661,6 @@ window.__ModuleLoader__.load({
         if (pending && VISIBLE_PENDING.has(pending.kind)) waiting = true;
         if (status.running === true) {
           running = true;
-          localUnreadSeenAt.delete(id);
         } else if (status.completionUnread === true) {
           // The page's own store is per-browser and cannot be retracted by
           // another client; the Host's shared ledger can, and once its answer
@@ -1420,7 +1668,6 @@ window.__ModuleLoader__.load({
           // "read on the phone" clear the desktop's green too.
           if (localDoneCounts(id)) done = true;
         } else {
-          localUnreadSeenAt.delete(id);
         }
       }
       // Unseen failure outranks live activity: it is what the user must act on.
@@ -1437,25 +1684,48 @@ window.__ModuleLoader__.load({
 
     /** Map every workspace to its badge state from the live Host stores. */
     function computeLiveStates() {
-      if (!live) return null;
-      const statuses = live.status.getSnapshot();
-      if (!(statuses instanceof Map)) return null;
-      const workspaceRows = live.workspaces.list.getSnapshot().items || [];
-      const sessionList = live.sessions.list.getSnapshot();
-      const byId = sessionList.byId || {};
-      const mainId = Object.values(byId)
-        .find((session) => (session.retainedBy && session.retainedBy.mainView || 0) > 0)?.id;
-      // Subagent runs belong to the Session that spawned them, not to the child
-      // log the page keeps off to one side, so they are folded in before the
-      // per-workspace walk: a parent parked on a child's work is still busy.
-      const parents = subagentParentsOf(byId, sessionList.projectionsBySession);
-      const busyRoots = runningRootSessions(statuses, byId, parents);
+      observeRunSignals();
+      const statuses = statusSnapshot();
+      const workspaceRows = workspaceListSnapshot().items || [];
+      const list = sessionListSnapshot();
+      const byId = list.byId || {};
+      const mainId = Object.values(byId).find(row => (row?.retainedBy?.mainView || 0) > 0)?.id;
+      const parents = subagentParentsOf(byId, list.projectionsBySession);
+      const roots = new Map();
+      const consider = (id, state) => {
+        if (!stateAllowed(state) || isSessionArchived(id)) return;
+        const root = rootSessionIdOf(id, parents);
+        if (isSessionArchived(root) || !document.hidden && root === mainId && ['error','done'].includes(state)) return;
+        const prior = roots.get(root);
+        if (!prior || stateRank(state) < stateRank(prior)) roots.set(root, state);
+      };
+      for (const id of new Set([...statuses.keys(), ...Object.keys(byId), ...clientErrored])) {
+        const status = statuses.get(id);
+        if (status?.running || byId[id]?.running) {
+          clientErrored.delete(id);
+          consider(id, 'running');
+        }
+        if (VISIBLE_PENDING.has(status?.pendingInteraction?.kind)) consider(id, 'waiting');
+        if (clientErrored.has(id) && (document.hidden || id !== mainId)) consider(id, 'error');
+      }
+      for (const id of unreadSessionSet) if (localDoneCounts(id)) consider(id, 'done');
       const own = new Map();
       for (const ws of workspaceRows) {
-        const state = stateOfWorkspace(ws.workspaceId, ws.sessionIds || [], statuses, busyRoots);
-        if (state) own.set(ws.workspaceId, state);
+        for (const id of ws.sessionIds || []) {
+          const state = roots.get(id);
+          if (state && (!own.has(ws.workspaceId) || stateRank(state) < stateRank(own.get(ws.workspaceId)))) own.set(ws.workspaceId, state);
+        }
       }
-      return { own, states: liftHiddenStates(own, workspaceRows), mainId };
+      // DOM/native facts are equal-priority inputs too, not merely a fallback
+      // when the whole live tuple happens to be unavailable.
+      for (const row of document.querySelectorAll('div[data-row-key^="session:"]')) {
+        const id = row.getAttribute('data-row-key').slice(8);
+        const state = sessionState(row, id, roots);
+        const owner = workspaceRows.find(ws => ws.sessionIds?.includes(id))?.workspaceId
+          || workspaceOfSession[id] || groupOfWorkspaceId(row.closest('div[class*="groupSection"]'));
+        if (owner && state && (!own.has(owner) || stateRank(state) < stateRank(own.get(owner)))) own.set(owner, state);
+      }
+      return { own, states:liftHiddenStates(own, workspaceRows), mainId, roots };
     }
 
     /**
@@ -1475,26 +1745,54 @@ window.__ModuleLoader__.load({
      * Repeats are throttled, so a mark that never clears cannot turn into a
      * request every time the sidebar repaints.
      */
-    function reportSeenSession(mainId, stillMarked) {
-      const next = mainId || null;
-      const repeated = next === lastSeenMainId;
-      if (repeated) {
-        if (!stillMarked) return;
-        const now = Date.now();
-        if (next !== null && now - lastSeenReportAt < 1500) return;
-      }
+    // A document (not storage or a tab's copied sessionStorage) owns its reading
+    // view. Client-only HMR reuses this id and replaces the old 18s Host lease.
+    const VIEW_ID_KEY = Symbol.for('dsh-workspace-focus-enhancer:reading-view-id');
+    const viewId = document[VIEW_ID_KEY] || window.crypto?.randomUUID?.() || `focus-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    if (!document[VIEW_ID_KEY]) Object.defineProperty(document, VIEW_ID_KEY, { value:viewId });
+    const seenRequests = new Set();
+    function abortSeenRequests() {
+      for (const controller of seenRequests) controller.abort();
+      seenRequests.clear();
+    }
+    function sendSeenLease(sessionId) {
+      if (disposed) return;
+      // Superseded reading reports must not revive an older viewed session.
+      // These controllers never own settings, favorites, or their pending data.
+      abortSeenRequests();
+      const controller = new AbortController();
+      seenRequests.add(controller);
+      fetch('/api/workspace-order/clear-error', {
+        method:'POST', headers:{ 'content-type':'application/json' },
+        body:JSON.stringify({ sessionId, viewId }), keepalive:true, signal:controller.signal
+      }).catch(() => {}).finally(() => { seenRequests.delete(controller); });
+    }
+    const SEEN_HEARTBEAT_MS = 5000;
+    let lastSeenMainId;
+    let lastSeenReportAt = -Infinity;
+    function reportSeenSession(mainId, stillMarked, force = false) {
+      if (disposed) return;
+      const next = document.hidden ? null : mainId || null;
+      const changed = next !== lastSeenMainId;
+      const elapsed = Date.now() - lastSeenReportAt;
+      if (!force && next === lastSeenMainId && elapsed < SEEN_HEARTBEAT_MS && (!stillMarked || elapsed < 1500)) return;
       lastSeenMainId = next;
       lastSeenReportAt = Date.now();
-      if (next) clientErrored.delete(next);
-      fetch('/api/workspace-order/clear-error', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: next })
-      }).catch(() => {});
+      if (next) {
+        clientErrored.delete(next);
+        if (changed) invalidateUnread(next);
+        else { unreadSessionSet.delete(next); retiredLocalUnread.add(next); }
+      }
+      sendSeenLease(next);
     }
-    let lastSeenMainId = undefined;
-    /** When the last report went out, so repeats for one session stay rare. */
-    let lastSeenReportAt = 0;
+    function releaseSeenLease() {
+      // Page hide/unload still releases while the plugin is alive. Context
+      // teardown may follow removed Host routes: it aborts, never sends anew.
+      if (disposed) return;
+      sendSeenLease(null);
+      lastSeenMainId = null;
+      lastSeenReportAt = Date.now();
+    }
 
     /** Adopt the Host's starred list. An unchanged list repaints nothing. */
     function applyFavorites(list) {
@@ -1512,9 +1810,17 @@ window.__ModuleLoader__.load({
         window.localStorage.setItem(FAVORITES_STORAGE_KEY, JSON.stringify(favoriteIds));
       } catch {}
       if (starMenu) {
+        const focusedId = document.activeElement?.getAttribute('data-session-id');
+        const hadMenuFocus = starMenu.contains(document.activeElement);
+        const previousFocus = document.activeElement;
+        const anchor = starMenuAnchor;
         closeStarMenu();
-        const anchor = document.querySelector('.dsh-order-star-filter');
-        if (anchor && !disposed) toggleStarMenu(anchor);
+        if (anchor?.isConnected && !disposed) {
+          toggleStarMenu(anchor);
+          const focused = focusedId && Array.from(starMenu.querySelectorAll('[data-session-id]')).find(item => item.getAttribute('data-session-id') === focusedId);
+          if (focused) focused.focus({ preventScroll:true });
+          else if (!hadMenuFocus && previousFocus?.isConnected) previousFocus.focus({ preventScroll:true });
+        }
       }
       renderDshEnhancements();
     }
@@ -1576,9 +1882,22 @@ window.__ModuleLoader__.load({
             cachePendingChoices(FAVORITES_PENDING_KEY, favoriteChanges);
             setFavorites(overlayFavorites(data.favoriteIds));
           }
+          favoritesError = '';
+          if (!disposed) {
+            for (const star of document.querySelectorAll('.dsh-order-star[aria-describedby]')) feedbackNear(star, '');
+            const note = starMenu?.querySelector('.dsh-order-star-menu-feedback');
+            if (note?.textContent === text('error.favoriteSave')) {
+              for (const item of starMenu.querySelectorAll('[aria-describedby]')) item.removeAttribute('aria-describedby');
+              note.remove();
+            }
+          }
           return !disposed;
         } catch (err) {
-          if (!disposed) console.warn('[workspace-order] 收藏暂未保存，将重试本次操作:', err);
+          if (!disposed) {
+            favoritesError = 'error.favoriteSave';
+            if (starMenu) menuFeedback(starMenu.querySelector('[role="menuitem"]') || starMenu, text(favoritesError));
+            console.warn('[workspace-order] 收藏暂未保存，将重试本次操作:', err);
+          }
           return false;
         }
       })().finally(() => { favoritesSync = null; });
@@ -1600,7 +1919,7 @@ window.__ModuleLoader__.load({
     /** Recompute badges, retire the red mark once its session is open, repaint. */
     function refresh() {
       if (disposed) return;
-      if (!live && rootCtx) attachLiveStatus(rootCtx);
+      if (rootCtx) attachLiveStatus(rootCtx);
       const liveStates = computeLiveStates();
       // The live store knows the current session only once it has settled; the
       // page marks the selected row itself, which is never stale. Preferring the
@@ -1616,8 +1935,10 @@ window.__ModuleLoader__.load({
       reportSeenSession(onScreen, stillMarked);
       renderDshEnhancements();
     }
+    let statusPollQueued = false;
     async function updateStatus() {
-      if (isFetching || disposed || pendingPins.size) return;
+      statusPollQueued = false;
+      if (isFetching || disposed || pendingPins.size) { if (!disposed) statusPollQueued = true; return; }
       isFetching = true;
       const polledSettingsEpoch = settingsEpoch;
       const polledFavoritesEpoch = favoritesEpoch;
@@ -1626,11 +1947,18 @@ window.__ModuleLoader__.load({
       // can end in flight, and the stale reply must not count as a newer
       // ledger that retires the green the ending just raised.
       const requestedAt = Date.now();
+      const polledUnreadCut = unreadPollCut();
       try {
         const res = await fetch('/api/workspace-order/status');
-        if (!res.ok) throw Object.assign(new Error('Status request failed'), { status: res.status });
+        const data = await res.json();
+        if (data?.stateRead?.status === 'degraded') {
+          if (!disposed) { setHostError('noteHostDegraded'); refresh(); }
+          return; // HTTP 200 must not turn an error payload into an exact ledger.
+        }
+        if (!res.ok || data?.error || data?.success === false || !Array.isArray(data?.pinned)) {
+          throw Object.assign(new Error('Status request failed'), { status: res.status });
+        }
         if (res.ok) {
-          const data = await res.json();
           if (disposed || pendingPins.size || polledPinsEpoch !== pinsEpoch) return;
           setHostError('');
           lastStatusAt = requestedAt;
@@ -1644,42 +1972,19 @@ window.__ModuleLoader__.load({
           // us; the Host now reports them too, so a page that cannot reach that
           // store still shows the orange question instead of a green spinner.
           waitingSet = new Set(data.waiting || []);
+          waitingSessionSet = new Set(data.waitingSessions || []);
+          // Running sessions, subagents folded into the Session that started
+          // them. A page that cannot reach the live store still needs this:
+          // the workspace above the row would spin while the row itself showed
+          // a plain idle dot.
+          runningSessionSet = new Set(data.runningSessions || []);
           unreadSet = new Set(data.unread || []);
-          // A green check is the one fact with no second source: the page's own
-          // store only knows it for sessions it watched end, and the Host is the
-          // only place that remembers "finished, not read yet" across a page
-          // reload, a dropped socket, or a Host restart. So the session-level
-          // list may only ever ADD a check, never take one away — a turn that
-          // ended while the link was down is exactly the case this must show.
-          const listedUnread = Array.isArray(data.unreadSessions)
-            ? new Set(data.unreadSessions)
-            : (Array.isArray(data.unread) ? new Set() : null);
-          if (listedUnread === null) {
-            sessionMarksKnown = null;
-          } else {
-            sessionMarksKnown = true;
-            unreadSessionSet = unionOfSets(unreadSessionSet, listedUnread);
-            // Union alone would remember a check the Host has since retired, so
-            // the kept side is narrowed to replies that are still unread by the
-            // Host's own account: listed per session, or listed on a workspace
-            // whose exact session list is still the only thing the Host sent.
-            const stillUnread = new Set(listedUnread);
-            for (const workspaceId of unreadSet) {
-              for (const sessionId of sessionsOfWorkspace(workspaceId)) stillUnread.add(sessionId);
-            }
-            for (const sessionId of unreadSessionSet) {
-              if (!stillUnread.has(sessionId)) unreadSessionSet.delete(sessionId);
-            }
-          }
+          // A supplied exact list is authoritative. Never union it with the
+          // workspace ledger or the previous poll (that resurrected old unread).
+          applyUnreadSnapshot(data.unreadSessions, polledUnreadCut);
+          applySessionMetadata(data.archivedSessions, data.sessionTitles);
           hostParents = data.parents && typeof data.parents === 'object' ? data.parents : Object.create(null);
           workspaceOfSession = data.owners && typeof data.owners === 'object' ? data.owners : Object.create(null);
-          // Sessions come and go; a sighting for one the Host no longer owns
-          // would otherwise keep its clock running forever.
-          if (localUnreadSeenAt.size) {
-            for (const sessionId of localUnreadSeenAt.keys()) {
-              if (!Object.hasOwn(workspaceOfSession, sessionId)) localUnreadSeenAt.delete(sessionId);
-            }
-          }
           hostProtocol = Number(data.protocolVersion) || 0;
           if (Array.isArray(data.favorites) && polledFavoritesEpoch === favoritesEpoch && !favoritesSync) {
             applyFavorites(overlayFavorites(data.favorites));
@@ -1696,6 +2001,7 @@ window.__ModuleLoader__.load({
         if (!disposed) setHostError(e.status === 401 || e.status === 403 ? 'noteHostAuth' : 'noteHostUnavailable');
       } finally {
         isFetching = false;
+        if (statusPollQueued && !disposed && !pendingPins.size) queueMicrotask(updateStatus);
       }
     }
 
@@ -1725,6 +2031,7 @@ window.__ModuleLoader__.load({
         pinnedSet.add(workspaceId);
       }
       renderDshEnhancements();
+      const pinnedUnreadCut = unreadPollCut();
 
       try {
         const res = await fetch('/api/workspace-order/toggle-pin', {
@@ -1735,27 +2042,35 @@ window.__ModuleLoader__.load({
         const data = await res.json();
         if (!res.ok || !data.success) throw new Error(data.error || '置顶失败，请重试');
         if (disposed) return;
-        pinnedSet = new Set(data.pinnedIds || []);
-        fallbackBusy = new Set(data.busyIds || []);
-        erroredSet = new Set(data.erroredIds || []);
-        if (Array.isArray(data.waitingIds)) waitingSet = new Set(data.waitingIds);
-        if (Array.isArray(data.unreadIds)) unreadSet = new Set(data.unreadIds);
-        if (Array.isArray(data.unreadSessionIds)) unreadSessionSet = new Set(data.unreadSessionIds);
-        if (data.parents && typeof data.parents === 'object') hostParents = data.parents;
-        if (data.owners && typeof data.owners === 'object') workspaceOfSession = data.owners;
-        if (Array.isArray(data.erroredSessionIds)) erroredSessionSet = new Set(data.erroredSessionIds);
+        feedbackNear(btnElement, '');
+        if (Array.isArray(data.pinnedIds)) pinnedSet = new Set(data.pinnedIds);
+        if (data.stateRead?.status === 'degraded') setHostError('noteHostDegraded');
+        else {
+          if (Array.isArray(data.busyIds)) fallbackBusy = new Set(data.busyIds);
+          if (Array.isArray(data.runningSessionIds)) runningSessionSet = new Set(data.runningSessionIds);
+          if (Array.isArray(data.erroredIds)) erroredSet = new Set(data.erroredIds);
+          if (Array.isArray(data.waitingIds)) waitingSet = new Set(data.waitingIds);
+          if (Array.isArray(data.waitingSessionIds)) waitingSessionSet = new Set(data.waitingSessionIds);
+          if (Array.isArray(data.unreadIds)) unreadSet = new Set(data.unreadIds);
+          if (Array.isArray(data.unreadSessionIds)) applyUnreadSnapshot(data.unreadSessionIds, pinnedUnreadCut);
+          applySessionMetadata(data.archivedSessionIds, data.sessionTitles);
+          if (data.parents && typeof data.parents === 'object') hostParents = data.parents;
+          if (data.owners && typeof data.owners === 'object') workspaceOfSession = data.owners;
+          if (Array.isArray(data.erroredSessionIds)) erroredSessionSet = new Set(data.erroredSessionIds);
+        }
       } catch (err) {
         if (disposed) return;
         // Rollback on failure
         if (currentlyPinned) pinnedSet.add(workspaceId);
         else pinnedSet.delete(workspaceId);
         console.error('[workspace-order] 置顶失败:', err);
+        feedbackNear(btnElement, 'error.pinSave');
       } finally {
         pendingPins.delete(workspaceId);
         pinsEpoch += 1;
         if (!disposed) btnElement.disabled = false;
       }
-      if (!disposed) refresh();
+      if (!disposed) { refresh(); if (statusPollQueued) void updateStatus(); }
     }
 
     /**
@@ -1786,7 +2101,7 @@ window.__ModuleLoader__.load({
     function currentWorkspaceId(liveStates) {
       if (!settings.highlightCurrent) return void 0;
       if (liveStates && liveStates.mainId) {
-        const rows = live.workspaces.list.getSnapshot().items || [];
+        const rows = workspaceListSnapshot().items || [];
         const owner = rows.find(ws => Array.isArray(ws.sessionIds) && ws.sessionIds.includes(liveStates.mainId));
         // A row the user cannot see cannot be boxed; step up, or let the page's
         // own marks decide when the store carries no paths to walk.
@@ -1901,7 +2216,7 @@ window.__ModuleLoader__.load({
         if (groupOfWorkspaceId(section) !== targetId) section.classList.remove('dsh-order-current-group');
       }
       if (!targetId) return;
-      const row = document.querySelector(`div[data-row-key="workspace:${targetId}"]`);
+      const row = workspaceRowElement(targetId);
       const section = row && (row.closest('div[class*="groupSection"]') || row.parentElement);
       if (section) section.classList.add('dsh-order-current-group');
     }
@@ -1950,7 +2265,7 @@ window.__ModuleLoader__.load({
      * @returns a workspace id, or undefined when no card can carry it.
      */
     function hiddenStarOwnerOf(sessionId) {
-      const rows = live ? (live.workspaces.list.getSnapshot().items || []) : [];
+      const rows = live ? (workspaceListSnapshot().items || []) : [];
       const owner = rows.find(ws => Array.isArray(ws.sessionIds) && ws.sessionIds.includes(sessionId));
       if (owner) return visibleOwnerOf(owner.workspaceId, rows);
       // The page's workspace list is out of reach, so the Host's own nesting is
@@ -1964,13 +2279,13 @@ window.__ModuleLoader__.load({
 
     /** The rendered row of a session, or undefined while it is not on screen. */
     function renderedSessionRow(sessionId) {
-      return document.querySelector(`div[data-row-key="session:${sessionId}"]`) || void 0;
+      return document.querySelector(`div[data-row-key="session:${window.CSS.escape(sessionId)}"]`) || void 0;
     }
 
     /** Whether a session lives in this workspace, per the Host's own mapping. */
     function sessionBelongsTo(sessionId, workspaceId) {
       if (!live) return false;
-      const rows = live.workspaces.list.getSnapshot().items || [];
+      const rows = workspaceListSnapshot().items || [];
       const owner = rows.find(ws => Array.isArray(ws.sessionIds) && ws.sessionIds.includes(sessionId));
       return !!owner && owner.workspaceId === workspaceId;
     }
@@ -1992,155 +2307,175 @@ window.__ModuleLoader__.load({
         star.addEventListener('click', (event) => {
           event.stopPropagation();
           event.preventDefault();
-          toggleFavorite(sessionId);
+          void toggleFavorite(sessionId).then(saved => feedbackNear(star, saved ? '' : 'error.favoriteSave'));
         });
       }
       const state = starred ? 'true' : 'false';
       if (star.getAttribute('data-starred') !== state) {
         star.setAttribute('data-starred', state);
         star.innerHTML = starred ? STAR_FILLED_SVG : STAR_SVG;
-        const label = starred ? '取消收藏' : '收藏此会话';
-        star.title = label;
-        star.setAttribute('aria-label', label);
-        star.setAttribute('aria-pressed', starred ? 'true' : 'false');
       }
+      const label = text(starred ? 'action.unfavorite' : 'action.favorite');
+      star.title = label;
+      star.setAttribute('aria-label', label);
+      star.setAttribute('aria-pressed', starred ? 'true' : 'false');
       if (row.firstElementChild !== star) row.insertBefore(star, row.firstChild);
     }
 
     /**
      * Where the page keeps a session row's state dot.
      *
-     * The page renders one status dot per row, and only while it has a state it
-     * can name. For every other state it hands the same 16px leading cell to the
-     * `sidebar.session.row.leading` slot, which sits empty at `display: contents`
-     * when the user has no plugin filling it. Handing back the cell — not the row
-     * — is what lets an extra mark take the dot's place without shifting the
-     * title, and appending after the page's own child leaves the slot's contents
-     * under the page's control.
+     * The page paints a dot into the session's leading cell only while it has a
+     * state it can name — running, waiting, or a completion this page has not
+     * read — and hands the cell to the `sidebar.session.row.leading` slot for
+     * everything else. The slot is an empty `display: contents` div in this
+     * build, so an idle row has no dot at all. Handing back the cell — not the
+     * row — is what lets the fallback mark take the dot's place without
+     * shifting the title, and appending after the page's own child leaves the
+     * slot's contents under the page's control.
      */
     function sessionMarkCell(row) {
       return row.querySelector('[data-slot="sidebar.session.row.leading"]')
         || row.querySelector('span[class*="slot"]');
     }
 
-    /** The page's own status dot on this row, or null while it paints none. */
+    /**
+     * The page's own status dot on this row, or null while it paints none.
+     * The dot sits in the same leading span as the slot, one level outside it,
+     * so it has to be looked up from the cell rather than from the slot.
+     */
     function pageStatusDot(row) {
       const cell = row.querySelector('span[class*="slot"]');
-      return cell ? cell.querySelector('[data-state]') : null;
+      if (!cell) return row.querySelector('[data-state]');
+      return cell.querySelector('[data-state]') || row.querySelector('[data-state]');
     }
 
-    /**
-     * Mark one session row as failed, so its dot stops claiming the turn finished
-     * cleanly. The page decides a session's dot from what it knows — running, or a
-     * completion waiting to be read — and it has no notion of failure, so a turn
-     * that broke is painted exactly like one that succeeded. The mark is dropped
-     * as soon as the failure has been seen, which is what opening the session does.
-     *
-     * A running session is left alone: work in progress outranks a stale failure,
-     * and the row is about to be repainted anyway. Neither is the session on
-     * screen marked — opening it is what "seeing" the failure means, and the row
-     * says so itself.
-     */
-    function showsFailure(row, sessionId) {
-      const failed = erroredSessionSet.has(sessionId) || clientErrored.has(sessionId);
-      // `data-state="ongoing"` is the page's spinner; a live turn is never a
-      // failure, however the previous one ended.
-      const spinning = row.querySelector('[data-state="ongoing"]') !== null;
-      const onScreen = row.getAttribute('aria-selected') === 'true';
-      return settings.badgeError && failed && !spinning && !onScreen;
+    function applySessionMetadata(archived, titles) {
+      if (Array.isArray(archived)) { archivedSessionSet = new Set(archived); archivedSessionsKnown = true; }
+      if (titles && typeof titles === 'object' && !Array.isArray(titles)) { hostSessionTitles = titles; sessionTitlesKnown = true; }
     }
-
-    function paintSessionFailure(row, sessionId) {
-      const wanted = showsFailure(row, sessionId);
-      if (row.classList.contains('dsh-order-session-errored') !== wanted) {
-        row.classList.toggle('dsh-order-session-errored', wanted);
-      }
+    function isSessionArchived(sessionId) {
+      const native = workspaceListSnapshot().archivedSessionIds;
+      if (Array.isArray(native) && native.includes(sessionId)) return true;
+      if (archivedSessionsKnown) return archivedSessionSet.has(sessionId);
+      if (Array.isArray(native)) return false;
+      return !!renderedSessionRow(sessionId)?.className?.includes('_archived');
     }
-
-    /**
-     * Reconcile one session row's dot with the Host's shared unread ledger, in
-     * both directions.
-     *
-     * Up: the page's own store only knows a completion this page watched end,
-     * so a reply that finished while nobody was looking here — on the desktop
-     * while this is the phone, say — leaves the row a plain idle dot even
-     * though the workspace above it already wears the green check. The ledger
-     * knows better, and the row is lifted to match.
-     *
-     * Down: the page's store keeps its green until the session is opened on
-     * *this* page, and no other client can retract it; the ledger can. Once a
-     * poll newer than this page's own sighting has come back without the
-     * session, the reply was read somewhere else and the green is stale.
-     *
-     * The session on screen is left alone in both directions — opening it is
-     * exactly what "read" means — and a visible failure outranks both, since
-     * the errored rule paints its own colour over the done state.
-     */
-    function paintSessionUnread(row, sessionId) {
-      const onScreen = row.getAttribute('aria-selected') === 'true';
-      const spinning = row.querySelector('[data-state="ongoing"]') !== null;
-      const allowed = settings.badgeRunningDone && !onScreen && !spinning;
-      // The Host's per-session list is the only cross-client source; without
-      // it (old Host, or no successful poll yet) neither correction applies.
-      const ledgerKnown = sessionMarksKnown === true && hostFresh();
-      const statuses = live ? live.status.getSnapshot() : null;
-      const localDone = statuses instanceof Map
-        && statuses.get(sessionId)?.completionUnread === true;
-      const hostUnread = ledgerKnown && unreadSessionSet.has(sessionId);
-      const retired = allowed && ledgerKnown && localDone && !localDoneCounts(sessionId);
-      const unreadWanted = allowed && hostUnread && !retired;
-      if (row.classList.contains('dsh-order-session-unread') !== unreadWanted) {
-        row.classList.toggle('dsh-order-session-unread', unreadWanted);
-      }
-      if (row.classList.contains('dsh-order-session-read') !== retired) {
-        row.classList.toggle('dsh-order-session-read', retired);
-      }
+    function archiveMetadataKnown() {
+      const native = workspaceListSnapshot();
+      return native.phase === 'ready' && native.state !== 'loading' && Array.isArray(native.archivedSessionIds)
+        || archivedSessionsKnown && hostFresh() && !hostError;
     }
-
-    /**
-     * Draw the state the page has no glyph for, in the cell it reserved for one.
-     *
-     * The page paints its dot only for the three states it understands, so the
-     * two corrections above — an unseen failure, and a reply the shared ledger
-     * still calls unread — land on an empty cell whenever the row is otherwise
-     * idle. Recolouring could not reach them, which is why a workspace could wear
-     * the red exclamation with no row inside it wearing anything at all. This
-     * puts a dot of the page's own size and colour in that cell.
-     *
-     * It stands down the moment the page paints its own dot: exactly one mark per
-     * row, and the page's is preferred, since the recolour rules above already
-     * speak for it. `data-mark` rather than `data-state` keeps the two apart.
-     */
-    function paintSessionMark(row, sessionId) {
-      const existing = row.querySelector('.dsh-order-session-mark');
+    function liveSessionStatus(sessionId) { return statusSnapshot().get(sessionId); }
+    function sessionState(row, sessionId, roots) {
+      if (isSessionArchived(sessionId)) return undefined;
       const dot = pageStatusDot(row);
-      let wanted = null;
-      if (!dot) {
-        if (showsFailure(row, sessionId)) wanted = 'error';
-        else if (row.classList.contains('dsh-order-session-unread')) wanted = 'done';
+      const native = dot?.getAttribute('data-state');
+      const status = liveSessionStatus(sessionId);
+      const viewed = !document.hidden && (row?.getAttribute('aria-selected') === 'true'
+        || sessionId === lastSeenMainId);
+      const candidates = [];
+      if (native === 'warning' || waitingSessionSet.has(sessionId) || VISIBLE_PENDING.has(status?.pendingInteraction?.kind)) candidates.push('waiting');
+      if (!viewed && (native === 'error' || erroredSessionSet.has(sessionId) || clientErrored.has(sessionId))) candidates.push('error');
+      if (native === 'ongoing' || runningSessionSet.has(sessionId) || status?.running) candidates.push('running');
+      if (roots?.has(sessionId) && (!viewed || !['error','done'].includes(roots.get(sessionId)))) candidates.push(roots.get(sessionId));
+      if (!viewed && localDoneCounts(sessionId)) candidates.push('done');
+      return candidates.filter(stateAllowed).sort((a,b) => stateRank(a) - stateRank(b))[0];
+    }
+    /** A native dot and a fallback share exactly one resolution. Each switch
+     * filters candidates BEFORE ranking, so disabling waiting never hides error. */
+    function paintSessionMark(row, sessionId, roots) {
+      const state = sessionState(row, sessionId, roots);
+      const dot = pageStatusDot(row);
+      let mark = row.querySelector('.dsh-order-session-mark');
+      for (const stale of row.querySelectorAll('.dsh-order-native-mark')) {
+        if (stale !== dot) clearNativeMark(stale);
       }
-      if (!wanted) {
-        if (existing) existing.remove();
+      if (dot) {
+        const native = dot.getAttribute('data-state');
+        // Preserve native states controlled by a disabled switch unless another
+        // enabled state won. Retire old native completion only if its own switch
+        // is enabled; this is not a global hiding rule.
+        const retired = !state && settings.badgeRunningDone && native === 'done' && !localDoneCounts(sessionId);
+        if (dot.tagName?.toLowerCase() === 'svg') {
+          if (!state && !retired) { clearNativeMark(dot); mark?.remove(); return; }
+          // Read CSS dimensions before hiding. A rotating SVG's bounding box can
+          // expand mid-frame, so computed width/height outrank that measurement.
+          const computed = getComputedStyle(dot);
+          const bounds = dot.getBoundingClientRect();
+          const previous = nativeSvgSizes.get(dot) || { width:10, height:10 };
+          const dimension = (css, measured, fallback) => parseFloat(css) > 0 ? parseFloat(css) : measured > 0 ? measured : fallback;
+          const size = { width:dimension(computed.width, bounds.width, previous.width), height:dimension(computed.height, bounds.height, previous.height) };
+          nativeSvgSizes.set(dot, size);
+          dot.classList.add('dsh-order-native-mark', 'dsh-order-native-svg-hidden');
+          dot.removeAttribute('data-dsh-order-state');
+          setOwnedAttribute(dot, 'aria-hidden', 'true');
+          for (const label of dot.parentElement.querySelectorAll('[class*="visuallyHidden"]')) {
+            setOwnedAttribute(label, 'aria-hidden', 'true'); nativeStatusLabels.add(label);
+          }
+          if (!mark) { mark = document.createElement('span'); mark.className = 'dsh-order-session-mark'; }
+          mark.setAttribute('role','img');
+          mark.setAttribute('data-dsh-order-native-svg','');
+          mark.setAttribute('data-dsh-order-state', state || 'idle');
+          mark.setAttribute('aria-label', text(state ? STATES[state].key : 'state.idle'));
+          mark.title = mark.getAttribute('aria-label');
+          mark.style.width = `${size.width}px`; mark.style.height = `${size.height}px`;
+          if (mark.parentElement !== dot.parentElement || mark.nextElementSibling !== dot) dot.parentElement.insertBefore(mark, dot);
+          return;
+        }
+        if (mark) mark.remove();
+        if (state || retired) {
+          dot.classList.add('dsh-order-native-mark');
+          dot.setAttribute('data-dsh-order-state', state || 'idle');
+          setOwnedAttribute(dot, 'aria-hidden', 'false');
+          setOwnedAttribute(dot, 'role', 'img');
+          for (const label of dot.parentElement.querySelectorAll('[class*="visuallyHidden"]')) {
+            setOwnedAttribute(label, 'aria-hidden', 'true');
+            nativeStatusLabels.add(label);
+          }
+          setOwnedAttribute(dot, 'aria-label', state ? text(STATES[state].key) : text('state.idle'));
+          setOwnedAttribute(dot, 'title', state ? text(STATES[state].key) : text('state.idle'));
+        } else clearNativeMark(dot);
         return;
       }
+      if (!state) { if (mark) mark.remove(); return; }
       const cell = sessionMarkCell(row);
-      if (!cell) {
-        if (existing) existing.remove();
-        return;
-      }
-      let mark = existing;
-      if (!mark) {
-        mark = document.createElement('span');
-        mark.className = 'dsh-order-session-mark';
-        mark.setAttribute('aria-hidden', 'true');
-      }
-      if (mark.getAttribute('data-mark') !== wanted) {
-        mark.setAttribute('data-mark', wanted);
-        const label = wanted === 'error' ? '该会话异常中断，点开后消失' : '该会话有新回复';
-        mark.title = label;
-      }
-      // After the page's own child, so the slot keeps its contents.
+      if (!cell) { if (mark) mark.remove(); return; }
+      if (!mark) { mark = document.createElement('span'); mark.className = 'dsh-order-session-mark'; mark.setAttribute('role','img'); }
+      mark.removeAttribute('data-dsh-order-native-svg');
+      mark.style.width = ''; mark.style.height = '';
+      mark.setAttribute('data-dsh-order-state', state);
+      mark.setAttribute('aria-label', text(STATES[state].key));
+      mark.title = text(STATES[state].key);
       if (mark.parentElement !== cell) cell.appendChild(mark);
+    }
+    const ownedAttributes = new Map();
+    const nativeStatusLabels = new Set();
+    const nativeSvgSizes = new WeakMap();
+    function setOwnedAttribute(node, name, value) {
+      let attrs = ownedAttributes.get(node);
+      if (!attrs) { attrs = new Map(); ownedAttributes.set(node, attrs); }
+      const previous = attrs.get(name);
+      if (!previous || node.getAttribute(name) !== previous.value) attrs.set(name, { original:node.getAttribute(name), value });
+      else previous.value = value;
+      if (node.getAttribute(name) !== value) node.setAttribute(name, value);
+    }
+    function restoreOwnedAttributes(node) {
+      const attrs = ownedAttributes.get(node);
+      if (!attrs) return;
+      for (const [name, entry] of attrs) if (node.getAttribute(name) === entry.value) {
+        if (entry.original === null) node.removeAttribute(name); else node.setAttribute(name, entry.original);
+      }
+      ownedAttributes.delete(node);
+    }
+    function clearNativeMark(dot) {
+      dot.classList.remove('dsh-order-native-mark', 'dsh-order-native-svg-hidden');
+      nativeSvgSizes.delete(dot);
+      dot.removeAttribute('data-dsh-order-state');
+      restoreOwnedAttributes(dot);
+      for (const label of nativeStatusLabels) if (!label.isConnected || dot.parentElement?.contains(label)) {
+        restoreOwnedAttributes(label); nativeStatusLabels.delete(label);
+      }
     }
 
     /**
@@ -2150,10 +2485,10 @@ window.__ModuleLoader__.load({
      * where the eye already looks for stars instead of at the far right of the
      * card.
      *
-     * It sits *before* the badge, never between the badge and the name: the
-     * badge's own placement check requires it to be the title's immediate
-     * predecessor, so anything slipped in after it would make every repaint
-     * move both nodes and the mutation observer would never settle.
+     * It sits *before* the name, and after the state glyph when one is
+     * showing: the glyph has taken the folder slot, so the star follows it
+     * and then the name — the same order a session row uses (star, then status
+     * dot, then title).
      */
     function paintWorkspaceStar(row, count) {
       const titleContainer = row.querySelector('span[class*="projectText"]');
@@ -2171,18 +2506,18 @@ window.__ModuleLoader__.load({
         label.className = 'dsh-order-star-count-text';
         mark.appendChild(label);
       }
-      const text = mark.querySelector('.dsh-order-star-count-text');
+      const countText = mark.querySelector('.dsh-order-star-count-text');
       const shown = String(count);
-      if (text.textContent !== shown) text.textContent = shown;
-      const title = `有 ${count} 个已收藏但已折叠的会话`;
+      if (countText.textContent !== shown) countText.textContent = shown;
+      const title = text('favorites.hiddenCount', { n:count });
       if (mark.title !== title) {
         mark.title = title;
         mark.setAttribute('aria-label', title);
         mark.setAttribute('role', 'img');
       }
-      // Ahead of the badge when one is showing, otherwise ahead of the name.
-      const badge = row.querySelector(':scope > .dsh-order-state');
-      const anchor = badge && badge.parentElement === row ? badge : titleContainer;
+      // Ahead of the name. The state glyph, when one is showing, stands in the
+      // folder slot further left, so the star lands between the two.
+      const anchor = titleContainer;
       // Only move the mark when needed so the observer stays idle.
       if (mark.parentElement !== row || mark.nextElementSibling !== anchor) {
         row.insertBefore(mark, anchor);
@@ -2192,9 +2527,15 @@ window.__ModuleLoader__.load({
     /**
      * The sidebar's own header row: the one holding the search, filter and new
      * buttons. Returned only while it is on screen.
+     *
+     * The row carries a stable `data-sidebar-workspace-header` attribute, which
+     * survives the build renaming the CSS Module classes. The class selector is
+     * kept as a fallback for hosts that predate the attribute.
      */
     function sectionHeader() {
-      return document.querySelector('div[class*="_sectionHeader"]:has(> [class*="_headerActions"])') || void 0;
+      return document.querySelector('[data-sidebar-workspace-header]')
+        || document.querySelector('div[class*="_sectionHeader"]:has(> [class*="_headerActions"])')
+        || void 0;
     }
 
     /**
@@ -2216,13 +2557,20 @@ window.__ModuleLoader__.load({
           event.preventDefault();
           toggleStarMenu(button);
         });
+        button.addEventListener('keydown', event => {
+          if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp' || event.altKey || event.ctrlKey || event.metaKey) return;
+          event.preventDefault(); event.stopPropagation();
+          if (!starMenu) toggleStarMenu(button);
+          const items = menuFocusableItems(starMenu);
+          (event.key === 'ArrowUp' ? items.at(-1) : items[0])?.focus();
+        });
       }
       const count = favoriteIds.length;
-      const label = count ? `收藏的会话（${count}）` : '收藏的会话';
+      const label = text(count ? 'favorites.count' : 'action.favorites', { n:count });
       if (button.title !== label) {
         button.title = label;
         button.setAttribute('aria-label', label);
-        button.setAttribute('aria-haspopup', 'true');
+        button.setAttribute('aria-haspopup', 'menu');
       }
       button.setAttribute('data-active', count ? 'true' : 'false');
       // Slot the favourites button just ahead of the search box (or the native
@@ -2240,7 +2588,80 @@ window.__ModuleLoader__.load({
 
     /** Whether the favourites menu is currently on screen. */
     let starMenu = null;
+    let starMenuAnchor = null;
+    let favoritesError = '';
+    function feedbackNear(anchor, key) {
+      if (!anchor?.isConnected) return;
+      let note = anchor.parentElement.querySelector('.dsh-order-action-feedback');
+      if (!note) { note = document.createElement('span'); note.className = 'dsh-order-action-feedback'; note.setAttribute('role','status'); anchor.parentElement.appendChild(note); }
+      note.textContent = key ? text(key) : '';
+      if (!note.id) note.id = `dsh-focus-feedback-${viewId}-${++semanticId}`;
+      if (key) setOwnedAttribute(anchor, 'aria-describedby', note.id);
+      else { note.remove(); restoreOwnedAttributes(anchor); }
+    }
+    function menuFeedback(item, message, removableId) {
+      const menu = item.closest('.dsh-order-star-menu');
+      if (!menu) return;
+      let note = menu.querySelector('.dsh-order-star-menu-feedback');
+      if (!note) { note = document.createElement('div'); note.className = 'dsh-order-star-menu-feedback'; note.setAttribute('role','status'); menu.appendChild(note); }
+      note.textContent = message;
+      if (!note.id) note.id = `dsh-focus-menu-feedback-${viewId}`;
+      item.setAttribute('aria-describedby', note.id);
+      menu.querySelector('.dsh-order-star-menu-action')?.remove();
+      if (removableId) {
+        const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'dsh-order-star-menu-action';
+        remove.setAttribute('role','menuitem'); remove.textContent = text('action.removeFavorite');
+        remove.addEventListener('click', async event => {
+          event.preventDefault(); event.stopPropagation();
+          const saved = await toggleFavorite(removableId);
+          if (!saved && starMenu) menuFeedback(starMenu.querySelector('[role="menuitem"]') || starMenu, text('error.favoriteSave'));
+        });
+        menu.appendChild(remove);
+      }
+    }
 
+    function menuFocusableItems(menu) {
+      return Array.from(menu?.querySelectorAll('[role="menuitem"]') || []).filter(treeFocusable);
+    }
+    function paintArchivedMenuFooter(menu) {
+      const archivedItems = Array.from(menu.querySelectorAll('[data-session-id]')).filter(item => isSessionArchived(item.getAttribute('data-session-id')));
+      let footer = menu.querySelector('.dsh-order-star-menu-archive');
+      if (!archivedItems.length) {
+        if (footer) {
+          for (const item of menu.querySelectorAll('[aria-describedby]')) if (item.getAttribute('aria-describedby') === `dsh-focus-archive-note-${viewId}`) item.removeAttribute('aria-describedby');
+          footer.remove();
+        }
+        return;
+      }
+      if (!footer) {
+        footer = document.createElement('div'); footer.className = 'dsh-order-star-menu-archive';
+        const note = document.createElement('div'); note.className = 'dsh-order-star-menu-archive-note';
+        note.id = `dsh-focus-archive-note-${viewId}`; note.setAttribute('role','status'); footer.appendChild(note);
+        const action = document.createElement('button'); action.type = 'button'; action.className = 'dsh-order-star-menu-archive-action';
+        action.setAttribute('role','menuitem'); action.setAttribute('aria-describedby',note.id);
+        action.addEventListener('click', event => {
+          event.preventDefault(); event.stopPropagation();
+          // Match the native viewing-store action. This only reveals archived
+          // rows so the user can choose native Unarchive; it never opens one.
+          if (typeof workspaceView?.store?.update !== 'function') { note.textContent = text('error.archiveViewUnavailable'); return; }
+          try {
+            workspaceView.store.update(draft => { draft.archivedFilter = 'only'; });
+            if (workspaceView.getSnapshot().archivedFilter !== 'only') throw new Error('Archive filter was not applied');
+            closeStarMenu(true);
+          } catch { note.textContent = text('error.archiveViewUnavailable'); }
+        });
+        footer.appendChild(action); menu.appendChild(footer);
+      }
+      const note = footer.querySelector('.dsh-order-star-menu-archive-note');
+      const action = footer.querySelector('.dsh-order-star-menu-archive-action');
+      const available = typeof workspaceView?.store?.update === 'function';
+      const message = nativeText('toast.archivedNotOpenable') + (available ? '' : ` ${text('error.archiveViewUnavailable')}`);
+      if (note.textContent !== message) note.textContent = message;
+      const actionLabel = text('action.viewArchived');
+      if (action.textContent !== actionLabel) action.textContent = actionLabel;
+      action.disabled = !available; action.setAttribute('aria-disabled', available ? 'false' : 'true');
+      for (const item of archivedItems) item.setAttribute('aria-describedby', note.id);
+    }
     function toggleStarMenu(anchor) {
       if (starMenu) {
         closeStarMenu();
@@ -2248,25 +2669,40 @@ window.__ModuleLoader__.load({
       }
       const menu = document.createElement('div');
       menu.className = 'dsh-order-star-menu';
+      menu.id = `dsh-focus-menu-${viewId}`;
       menu.setAttribute('role', 'menu');
+      menu.setAttribute('aria-label', text('action.favorites'));
+      // macOS Desktop only excludes controls inside a declared window region.
+      // This menu lives on body, so it declares the exclusion itself; the CSS
+      // companion rule is the `-webkit-app-region: no-drag` on this class.
+      menu.setAttribute('data-window-drag-exclude', '');
+      menu.tabIndex = -1;
+      starMenuAnchor = anchor;
+      anchor.setAttribute('aria-controls', menu.id);
+      anchor.setAttribute('aria-expanded', 'true');
       if (!favoriteIds.length) {
         const empty = document.createElement('div');
         empty.className = 'dsh-order-star-menu-empty';
-        empty.textContent = '还没有收藏的会话。把鼠标移到会话上，点左侧的星标即可收藏。';
+        empty.textContent = text('favorites.empty');
         menu.appendChild(empty);
       } else {
         for (const sessionId of favoriteIds) {
           menu.appendChild(starMenuItem(sessionId));
         }
       }
-      placeStarMenu(menu, anchor);
+      paintArchivedMenuFooter(menu);
       document.body.appendChild(menu);
+      placeStarMenu(menu, anchor);
       starMenu = menu;
+      (menuFocusableItems(menu)[0] || menu).focus({ preventScroll:true });
+      // Keys can arrive before a zero-delay timer. Capture at window immediately
+      // so document-level native shortcuts cannot swallow this popup's Escape.
+      window.addEventListener('keydown', onKeydownForStarMenu, true);
+      if (favoritesError) menuFeedback(menu.querySelector('[role="menuitem"]') || menu, text(favoritesError));
       // A click anywhere else, or Escape, closes it.
       setTimeout(() => {
         if (disposed || starMenu !== menu) return;
         document.addEventListener('click', onDocumentClickForStarMenu, true);
-        document.addEventListener('keydown', onKeydownForStarMenu, true);
       }, 0);
     }
 
@@ -2275,24 +2711,57 @@ window.__ModuleLoader__.load({
     }
 
     function onKeydownForStarMenu(event) {
-      if (event.key === 'Escape') closeStarMenu();
+      if (!starMenu) return;
+      if (event.key === 'Escape') {
+        const ownsFocus = starMenu.contains(document.activeElement) || starMenuAnchor?.contains(document.activeElement);
+        const visible = node => !!node.getClientRects().length && !node.closest('[hidden], [inert], [aria-hidden="true"]')
+          && !['hidden','collapse'].includes(getComputedStyle(node).visibility);
+        const modal = Array.from(document.querySelectorAll('dialog[open], [role="dialog"][aria-modal="true"], [role="alertdialog"][aria-modal="true"]')).some(visible);
+        if (!ownsFocus || !visible(starMenu) || modal || event.defaultPrevented) {
+          closeStarMenu(false); return; // give native dialogs/editors their Escape
+        }
+        event.preventDefault(); event.stopImmediatePropagation(); closeStarMenu(true); return;
+      }
+      if (!starMenu.contains(event.target)) return;
+      if (event.key === 'Tab') {
+        // Return to the trigger, then let the browser perform ordinary Tab out.
+        closeStarMenu(true); return;
+      }
+      const items = menuFocusableItems(starMenu);
+      const index = items.indexOf(document.activeElement);
+      let next;
+      if (event.key === 'ArrowDown') next = items[(index + 1) % items.length];
+      else if (event.key === 'ArrowUp') next = items[(index + items.length - 1) % items.length];
+      else if (event.key === 'Home') next = items[0];
+      else if (event.key === 'End') next = items.at(-1);
+      else return;
+      if (next) { event.preventDefault(); event.stopPropagation(); next.focus(); }
     }
 
-    function closeStarMenu() {
+    function closeStarMenu(restoreFocus = false) {
       if (starMenu) {
         starMenu.remove();
         starMenu = null;
       }
       document.removeEventListener('click', onDocumentClickForStarMenu, true);
-      document.removeEventListener('keydown', onKeydownForStarMenu, true);
+      window.removeEventListener('keydown', onKeydownForStarMenu, true);
+      if (starMenuAnchor) {
+        starMenuAnchor.setAttribute('aria-expanded','false');
+        starMenuAnchor.removeAttribute('aria-controls');
+        if (restoreFocus && starMenuAnchor.isConnected) starMenuAnchor.focus({ preventScroll:true });
+      }
+      starMenuAnchor = null;
     }
 
     /** Anchor the menu under its button, kept inside the viewport. */
     function placeStarMenu(menu, anchor) {
       const box = anchor.getBoundingClientRect();
       menu.style.position = 'fixed';
-      menu.style.top = `${Math.round(box.bottom + 4)}px`;
-      menu.style.left = `${Math.round(Math.max(8, Math.min(box.left, window.innerWidth - 320)))}px`;
+      const bounds = menu.getBoundingClientRect();
+      const width = Math.min(bounds.width || 320, window.innerWidth - 16);
+      const height = Math.min(bounds.height, window.innerHeight / 2);
+      menu.style.top = `${Math.round(Math.max(8, Math.min(box.bottom + 4, window.innerHeight - height - 8)))}px`;
+      menu.style.left = `${Math.round(Math.max(8, Math.min(box.left, window.innerWidth - width - 8)))}px`;
     }
 
     /** One row of the favourites menu: the session's name, and where it lives. */
@@ -2304,33 +2773,35 @@ window.__ModuleLoader__.load({
       item.innerHTML = STAR_FILLED_SVG;
       const title = document.createElement('span');
       title.className = 'dsh-order-star-menu-title';
-      title.textContent = sessionTitleOf(sessionId) || sessionId;
+      title.textContent = sessionTitleOf(sessionId);
       const where = document.createElement('span');
       where.className = 'dsh-order-star-menu-where';
       where.textContent = workspaceTitleOfSession(sessionId);
       item.appendChild(title);
       item.appendChild(where);
       item.title = `${title.textContent}${where.textContent ? ` · ${where.textContent}` : ''}`;
+      if (isSessionArchived(sessionId)) { item.disabled = true; item.setAttribute('aria-disabled','true'); item.title += ` · ${nativeText('toast.archivedNotOpenable')}`; }
+      item.setAttribute('data-session-id', sessionId);
       item.addEventListener('click', (event) => {
         event.stopPropagation();
         event.preventDefault();
-        closeStarMenu();
-        openSessionById(sessionId);
+        void openSessionById(sessionId, item);
       });
       return item;
     }
 
     /** A session's display title, read from the Host's own list. */
     function sessionTitleOf(sessionId) {
-      if (!live) return void 0;
-      const row = (live.sessions.list.getSnapshot().byId || {})[sessionId];
-      return row && (row.title || row.name);
+      const row = (sessionListSnapshot().byId || {})[sessionId];
+      if (row?.blank) return nativeText('session.new');
+      const title = row ? row.title : hostSessionTitles[sessionId];
+      return typeof title === 'string' && title.trim() ? title : nativeText('session.untitled');
     }
 
     /** The workspace a session lives in, for orientation in the menu. */
     function workspaceTitleOfSession(sessionId) {
       if (!live) return '';
-      const rows = live.workspaces.list.getSnapshot().items || [];
+      const rows = workspaceListSnapshot().items || [];
       const owner = rows.find(ws => Array.isArray(ws.sessionIds) && ws.sessionIds.includes(sessionId));
       return owner ? (owner.title || owner.path || '') : '';
     }
@@ -2339,27 +2810,155 @@ window.__ModuleLoader__.load({
      * Open a starred session through the page's own workspace service, which
      * expands whatever group holds it — the same path the sidebar's search uses.
      */
-    function openSessionById(sessionId) {
-      const service = live && live.uiWorkspace;
-      if (service && typeof service.openSession === 'function') {
-        try {
-          service.openSession(sessionId);
-          return true;
-        } catch (err) {
-          console.warn('[workspace-order] 打开会话失败:', err);
-        }
-      }
-      console.warn('[workspace-order] 打不开会话：官方入口当前不可用');
-      return false;
+    async function openSessionById(sessionId, item) {
+      // The public openSession API is not the sidebar's guardedOpen. Apply the
+      // same archive guard BEFORE invoking it; never silently unarchive a star.
+      if (isSessionArchived(sessionId)) { menuFeedback(item, nativeText('toast.archivedNotOpenable')); return false; }
+      const list = sessionListSnapshot();
+      const nativeKnown = list.phase === 'ready' && list.state !== 'loading';
+      // Session summaries and archive membership have independent service
+      // lifetimes. A ready session catalog does not certify an absent archive
+      // service, and title metadata is not a complete existence catalog.
+      if (!archiveMetadataKnown()) { menuFeedback(item, text('error.sessionUnknown')); return false; }
+      const missing = nativeKnown && !Object.hasOwn(list.byId || {}, sessionId)
+        && (!sessionTitlesKnown || !Object.hasOwn(hostSessionTitles, sessionId));
+      if (missing) { menuFeedback(item, text('error.sessionMissing'), sessionId); return false; }
+      const service = live.uiWorkspace;
+      if (typeof service?.openSession !== 'function') { menuFeedback(item, text('error.openUnavailable')); return false; }
+      try {
+        item?.setAttribute('aria-busy','true');
+        // Cordis consumers receive a ctx-shadowed ServiceProxy. Navigation owns
+        // the native mainReference and lifetime, not this plugin's child scope.
+        const owner = service[Symbol.for('cordis.original')] || service;
+        await Reflect.apply(owner.openSession, owner, [sessionId]);
+        if (!disposed) closeStarMenu(true);
+        return true;
+      } catch (err) {
+        if (!disposed) menuFeedback(item, text('error.openFailed'));
+        return false;
+      } finally { item?.removeAttribute('aria-busy'); }
     }
 
+    const treeSemanticNodes = new Set();
+    let semanticId = 0;
+    function ownedId(node) {
+      if (!node.id) setOwnedAttribute(node, 'id', `dsh-focus-${viewId}-${++semanticId}`);
+      treeSemanticNodes.add(node);
+      return node.id;
+    }
+    function groupChildren(section) {
+      const children = Array.from(section.children);
+      return [...children.filter(node => node.getAttribute('role') !== 'group'),
+        ...children.filter(node => node.getAttribute('role') === 'group')];
+    }
+    function treeFocusable(node) {
+      if (!node || node.disabled || node.tabIndex < 0 || node.closest('[inert], [hidden], [aria-hidden="true"]') || !node.getClientRects().length) return false;
+      const visibility = getComputedStyle(node).visibility;
+      return visibility !== 'hidden' && visibility !== 'collapse';
+    }
+    function visualTreeRows(tree) {
+      const walk = node => {
+        if (node.matches('[data-row-key]')) return [node];
+        const children = node.matches('div[class*="groupSection"]') ? groupChildren(node) : Array.from(node.children);
+        return children.flatMap(walk);
+      };
+      return walk(tree).filter(treeFocusable);
+    }
+    function sidebarTreeOf(node) {
+      const tree = node?.closest?.('[role="tree"]');
+      return tree?.querySelector('div[class*="groupSection"]') ? tree : null;
+    }
+    function restoreTreeSemantics() {
+      for (const node of treeSemanticNodes) restoreOwnedAttributes(node);
+      treeSemanticNodes.clear();
+    }
     function syncTreeOrderMode() {
-      const active = usesWorkspaceTree() && settings.treeSessionsFirst !== false;
+      const treeMode = usesWorkspaceTree();
+      const active = treeMode && settings.treeSessionsFirst !== false;
+      document.body.classList.toggle('dsh-order-tree-trays', treeMode);
       document.body.classList.toggle('dsh-order-sessions-first', active);
+      for (const row of document.querySelectorAll('[data-dsh-order-tray-row]')) {
+        if (!treeMode || !row.closest('div[class*="groupSection"]')) row.removeAttribute('data-dsh-order-tray-row');
+      }
+      if (treeMode) for (const section of document.querySelectorAll('div[class*="groupSection"]')) {
+        for (const row of section.querySelectorAll('[data-row-key]')) {
+          if (row.closest('div[class*="groupSection"]') === section) row.setAttribute('data-dsh-order-tray-row', '');
+        }
+      }
+      if (!active) { restoreTreeSemantics(); return; }
+      for (const node of treeSemanticNodes) if (!node.isConnected) { restoreOwnedAttributes(node); treeSemanticNodes.delete(node); }
+      // Own every direct child, including HoverCard anchors, exactly once. This
+      // makes the accessibility tree follow flex order without reparenting React
+      // nodes or depending on how many spans the native anchor contains.
+      for (const section of document.querySelectorAll('div[class*="groupSection"]')) {
+        if (!sidebarTreeOf(section)) continue;
+        treeSemanticNodes.add(section);
+        setOwnedAttribute(section, 'role', 'group');
+        setOwnedAttribute(section, 'aria-owns', groupChildren(section).map(ownedId).join(' '));
+      }
+    }
+    function onTreeKeydown(event) {
+      if (!document.body.classList.contains('dsh-order-sessions-first') || event.defaultPrevented
+        || event.altKey || event.ctrlKey || event.metaKey || event.isComposing) return;
+      const target = event.target instanceof Element ? event.target : null;
+      const tree = sidebarTreeOf(target);
+      const row = target?.closest('[data-row-key]');
+      if (!tree || !row || target.closest('input, textarea, select, [contenteditable="true"]')) return;
+      const rows = visualTreeRows(tree);
+      const index = rows.indexOf(row);
+      if (index < 0) return;
+      let next;
+      if (event.key === 'Tab') {
+        // Tab retains each row's native action buttons. Only bridge reordered
+        // row boundaries; inside a row the browser handles its controls normally.
+        const controls = Array.from(row.querySelectorAll('button, a[href], [tabindex]'))
+          .filter(treeFocusable);
+        if (!event.shiftKey && (target === row && controls.length || target !== row && target !== controls.at(-1))) return;
+        if (event.shiftKey && target !== row) return;
+        const adjacent = rows[index + (event.shiftKey ? -1 : 1)];
+        if (!adjacent) {
+          // The last *visual* row need not be last in React's DOM. Leave the
+          // entire tree instead of wrapping back into its later DOM siblings.
+          const all = Array.from(document.querySelectorAll('button, a[href], input, textarea, select, [tabindex]'))
+            .filter(treeFocusable);
+          const inside = all.map((node,i) => tree.contains(node) ? i : -1).filter(i => i >= 0);
+          const edge = event.shiftKey ? inside[0] : inside.at(-1);
+          next = all[edge + (event.shiftKey ? -1 : 1)];
+          if (!next) return; // no page target: retain browser-chrome Tab behavior
+        } else next = event.shiftKey ? Array.from(adjacent.querySelectorAll('button, a[href], input, textarea, select, [tabindex]'))
+          .filter(treeFocusable).at(-1) || adjacent : adjacent;
+      } else {
+        // Native row buttons and editors keep their own Arrow/Home/End behavior.
+        if (target !== row || event.shiftKey) return;
+        if (event.key === 'ArrowDown') next = rows[Math.min(rows.length - 1, index + 1)];
+        else if (event.key === 'ArrowUp') next = rows[Math.max(0, index - 1)];
+        else if (event.key === 'Home') next = rows[0];
+        else if (event.key === 'End') next = rows.at(-1);
+        else if (event.key === 'ArrowRight' && row.matches('[data-row-key^="workspace:"]')) {
+          if (row.getAttribute('aria-expanded') === 'false') { event.preventDefault(); event.stopPropagation(); row.click(); return; }
+          next = rows[index + 1];
+        } else if (event.key === 'ArrowLeft') {
+          if (row.matches('[data-row-key^="workspace:"]') && row.getAttribute('aria-expanded') === 'true') {
+            event.preventDefault(); event.stopPropagation(); row.click(); return;
+          }
+          const section = row.closest('div[class*="groupSection"]');
+          const owner = row.matches('[data-row-key^="workspace:"]') ? section?.parentElement?.closest('div[class*="groupSection"]') : section;
+          next = owner && Array.from(owner.querySelectorAll('[data-row-key^="workspace:"]')).find(node => node.closest('div[class*="groupSection"]') === owner);
+        } else return;
+      }
+      if (next) {
+        next.focus();
+        if (document.activeElement === next) { event.preventDefault(); event.stopPropagation(); }
+      }
     }
 
     function renderDshEnhancements() {
       if (disposed) return;
+      for (const node of Array.from(ownedAttributes.keys())) if (!node.isConnected) {
+        if (node.classList.contains('dsh-order-native-mark')) clearNativeMark(node);
+        else restoreOwnedAttributes(node);
+        treeSemanticNodes.delete(node); nativeStatusLabels.delete(node);
+      }
       syncTreeOrderMode();
       const rows = document.querySelectorAll('div[data-row-key^="workspace:"]');
       const liveStates = computeLiveStates();
@@ -2400,7 +2999,8 @@ window.__ModuleLoader__.load({
             pinBtn.setAttribute('data-pinned', pinnedState);
             pinBtn.innerHTML = isPinned ? PIN_FILLED_SVG : PIN_SVG;
           }
-          pinBtn.title = hostProtocol < 2 ? '主机修复尚未加载，请重启 Harness 后使用置顶' : isPinned ? '取消置顶' : '固定置顶';
+          pinBtn.title = text(hostProtocol < 2 ? 'error.hostProtocol' : isPinned ? 'action.unpin' : 'action.pin');
+          pinBtn.setAttribute('aria-pressed', isPinned ? 'true' : 'false');
           pinBtn.disabled = hostProtocol < 2 || pendingPins.has(workspaceId);
           pinBtn.setAttribute('aria-label', pinBtn.title);
         } else {
@@ -2409,9 +3009,19 @@ window.__ModuleLoader__.load({
           if (stale) stale.remove();
         }
 
-        // 2. Place the state badge before the title, outside its text container.
+        // 2. Put the state glyph in the row's folder slot.
+        //
+        //    The glyph takes the place of the folder icon rather than standing
+        //    next to it, so the row keeps the width it had while idle and the
+        //    name stays exactly where it was. A workspace that has something to
+        //    say therefore costs the list nothing.
+        //
+        //    The glyph goes in *before* the folder: the stylesheet hides the
+        //    folder on rows that carry a state, and the folder's own slot
+        //    would otherwise be left empty.
         const titleContainer = row.querySelector('span[class*="projectText"]');
         if (titleContainer) {
+          const folderSlot = row.querySelector(':scope > span[class*="folder"]');
           let badge = row.querySelector('.dsh-order-state');
           if (state) {
             const meta = STATES[state];
@@ -2422,18 +3032,23 @@ window.__ModuleLoader__.load({
             if (badge.getAttribute('data-state') !== state) {
               badge.setAttribute('data-state', state);
               badge.innerHTML = meta.svg;
-              badge.title = meta.title;
+              badge.title = text(meta.key);
               badge.setAttribute('role', 'img');
-              badge.setAttribute('aria-label', meta.title);
+              badge.setAttribute('aria-label', text(meta.key));
             }
+            badge.title = text(meta.key);
+            badge.setAttribute('aria-label', badge.title);
             // Only move the badge when needed so the observer stays idle.
-            if (badge.parentElement !== row || badge.nextElementSibling !== titleContainer) {
-              row.insertBefore(badge, titleContainer);
+            const anchor = folderSlot || titleContainer;
+            if (badge.parentElement !== row || badge.nextElementSibling !== anchor) {
+              row.insertBefore(badge, anchor);
             }
+            row.classList.add('dsh-order-has-state');
           } else {
             if (badge) {
               badge.remove();
             }
+            row.classList.remove('dsh-order-has-state');
           }
 
           // 3. Roll this workspace's hidden favourites onto its own card.
@@ -2445,7 +3060,21 @@ window.__ModuleLoader__.load({
       if (starMenu) {
         const anchor = document.querySelector('.dsh-order-star-filter');
         if (!anchor) closeStarMenu();
-        else placeStarMenu(starMenu, anchor);
+        else {
+          placeStarMenu(starMenu, anchor);
+          const ownedFocus = starMenu.contains(document.activeElement);
+          for (const item of starMenu.querySelectorAll('[data-session-id]')) {
+            const id = item.getAttribute('data-session-id');
+            const title = item.querySelector('.dsh-order-star-menu-title');
+            const name = sessionTitleOf(id);
+            if (title.textContent !== name) title.textContent = name;
+            const archived = isSessionArchived(id);
+            item.disabled = archived;
+            if (archived) item.setAttribute('aria-disabled','true'); else item.removeAttribute('aria-disabled');
+          }
+          paintArchivedMenuFooter(starMenu);
+          if (ownedFocus && (!starMenu.contains(document.activeElement) || document.activeElement.disabled)) (menuFocusableItems(starMenu)[0] || starMenu).focus({ preventScroll:true });
+        }
       }
 
       // 5. Every session on screen carries its own star, and a failed session
@@ -2457,9 +3086,7 @@ window.__ModuleLoader__.load({
         const sessionId = key.slice('session:'.length);
         if (!sessionId) continue;
         paintSessionStar(sessionRow, sessionId);
-        paintSessionUnread(sessionRow, sessionId);
-        paintSessionFailure(sessionRow, sessionId);
-        paintSessionMark(sessionRow, sessionId);
+        paintSessionMark(sessionRow, sessionId, liveStates?.roots);
       }
     }
 
@@ -2563,6 +3190,37 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The card's own switch: a real `role="switch"` button, so assistive
+     * technology and keyboard users get the same control the shipped cards
+     * offer, without importing the page's internal primitives module. Markup
+     * and the `aria-checked` contract follow the host's own switch.
+     * @param props - `checked`, `label`, and the change callback.
+     * @returns the switch button.
+     */
+    function ToggleSwitch({ checked, label, onChange }) {
+      return jsxRuntime.jsx('button', {
+        type: 'button',
+        role: 'switch',
+        'aria-checked': checked === true,
+        'aria-label': label,
+        title: label,
+        className: 'dsh-order-panel-switch',
+        onClick: () => { onChange(checked !== true); },
+        children: jsxRuntime.jsx('span', { className: 'dsh-order-panel-switch-thumb' })
+      });
+    }
+
+    /** The small state pill the disclosure header carries. */
+    function TagPill({ tone, children }) {
+      return jsxRuntime.jsx('span', { className: 'dsh-order-panel-group-tag', 'data-tone': tone, children });
+    }
+
+    /** A chevron that points down while closed and up while open. */
+    function Chevron({ open }) {
+      return jsxRuntime.jsx('span', { className: 'dsh-order-panel-chevron', 'data-open': open === true, 'aria-hidden': 'true' });
+    }
+
+    /**
      * One switch row: its name, its one-line explanation, and its toggle.
      */
     function SettingRow({ row, value, label, t, toggleSetting }) {
@@ -2571,8 +3229,7 @@ window.__ModuleLoader__.load({
           jsxRuntime.jsx('span', { className: 'dsh-order-panel-label', children: label }),
           jsxRuntime.jsx('span', { className: 'dsh-order-panel-hint', children: t(row.hintKey) })
         ] }),
-        jsxRuntime.jsx(primitives.Switch, {
-          className: 'dsh-order-panel-switch',
+        jsxRuntime.jsx(ToggleSwitch, {
           checked: value === true,
           label,
           onChange: (next) => { toggleSetting(row.key, next); }
@@ -2588,7 +3245,6 @@ window.__ModuleLoader__.load({
     function WorkspaceOrderPanel({ view, t, useWorkspaceOrderSettings, toggleSetting }) {
       // Hooks run before any early return: this component serves both views.
       const [open, setOpen] = react.useState(false);
-      const collapsible = !!(primitives.DisclosureRow && primitives.IconChecklistOutlineRegular);
       const snapshot = useWorkspaceOrderSettings((value) => value);
       const current = snapshot.settings || {};
       if (view === 'summary') return t('summary', { n: countEnabled(current), total: SETTING_ROWS.length });
@@ -2598,32 +3254,38 @@ window.__ModuleLoader__.load({
         : onCount === 0
           ? t('group.allOff')
           : t('group.partOn', { n: onCount, total: AWARENESS_ROWS.length });
-      const flatRows = [...ORDERING_ROWS, ...(collapsible ? [] : AWARENESS_ROWS)];
+      // Row click and Enter/Space both toggle, like the shipped disclosure row.
+      const onHeaderKeyDown = (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        setOpen((value) => !value);
+      };
       return jsxRuntime.jsxs('div', { className: 'dsh-order-panel', children: [
-        ...flatRows.map((row) => jsxRuntime.jsx(SettingRow, {
+        ...ORDERING_ROWS.map((row) => jsxRuntime.jsx(SettingRow, {
           row,
           value: current[row.key],
           label: t(row.labelKey),
           t,
           toggleSetting
         }, row.key)),
-        collapsible ? jsxRuntime.jsx(primitives.DisclosureRow, {
-          className: 'dsh-order-panel-group',
-          icon: jsxRuntime.jsx(primitives.IconChecklistOutlineRegular, { size: 14 }),
-          title: t('group.title'),
-          open,
-          expandable: true,
-          expandOnRowClick: true,
-          keepContentWhenOpen: true,
-          onToggle: () => { setOpen(value => !value); },
-          collapsedContent: primitives.Tag
-            ? jsxRuntime.jsx(primitives.Tag, {
-                className: 'dsh-order-panel-group-tag',
+        jsxRuntime.jsxs('div', { className: 'dsh-order-panel-group', 'data-open': open === true || void 0, children: [
+          jsxRuntime.jsxs('div', {
+            className: 'dsh-order-panel-group-header',
+            role: 'button',
+            tabindex: '0',
+            'aria-expanded': open === true,
+            onClick: () => { setOpen((value) => !value); },
+            onKeyDown: onHeaderKeyDown,
+            children: [
+              jsxRuntime.jsx(Chevron, { open }),
+              jsxRuntime.jsx('span', { className: 'dsh-order-panel-group-title', children: t('group.title') }),
+              jsxRuntime.jsx(TagPill, {
                 tone: onCount === AWARENESS_ROWS.length ? 'success' : onCount === 0 ? 'quiet' : 'warning',
                 children: groupState
               })
-            : groupState,
-          children: jsxRuntime.jsx('div', { className: 'dsh-order-panel-group-body', children:
+            ]
+          }),
+          open ? jsxRuntime.jsx('div', { className: 'dsh-order-panel-group-body', children:
             AWARENESS_ROWS.map((row) => jsxRuntime.jsx(SettingRow, {
               row,
               value: current[row.key],
@@ -2631,8 +3293,8 @@ window.__ModuleLoader__.load({
               t,
               toggleSetting
             }, row.key))
-          })
-        }) : null,
+          }) : null
+        ] }),
         jsxRuntime.jsx('p', {
           className: snapshot.hostAccepted && !snapshot.hostError ? 'dsh-order-panel-note' : 'dsh-order-panel-error',
           role: snapshot.hostAccepted && !snapshot.hostError ? void 0 : 'status',
@@ -2652,6 +3314,30 @@ window.__ModuleLoader__.load({
      */
     const PANEL_LOCALE = {
       zh: {
+        'state.waiting': '等你回答、批准或确认计划',
+        'state.error': '会话异常中断，打开后清除提醒',
+        'state.running': '正在工作',
+        'state.done': '已完成，有新回复未读',
+        'state.idle': '空闲',
+        'native.new': '新会话', 'native.untitled': '未命名',
+        'native.archivedGuard': '此会话已归档，请先取消归档再查看。',
+        'native.unarchive': '取消归档',
+        'action.pin': '固定置顶', 'action.unpin': '取消置顶',
+        'action.favorite': '收藏此会话', 'action.unfavorite': '取消收藏',
+        'action.favorites': '收藏的会话', 'action.removeFavorite': '移除此收藏',
+        'action.viewArchived': '查看已归档会话',
+        'error.archiveViewUnavailable': '归档列表入口暂不可用，请等待侧栏恢复后重试。',
+        'favorites.count': '收藏的会话（{n}）',
+        'favorites.hiddenCount': '有 {n} 个已收藏但已折叠的会话',
+        'favorites.empty': '还没有收藏的会话。使用会话左侧的星标即可收藏。',
+        'error.favoriteSave': '收藏暂未保存，已保留本次选择，恢复连接后重试。',
+        'error.pinSave': '置顶保存失败，已恢复原状态，请重试。',
+        'error.sessionMissing': '此会话已不存在，可以移除此收藏。',
+        'error.sessionUnknown': '暂时无法确认会话是否已归档，请恢复连接后重试。',
+        'error.openUnavailable': '官方会话入口暂不可用，请稍后重试。',
+        'error.openFailed': '无法打开此会话，请稍后重试。',
+        'error.hostProtocol': '主机修复尚未加载，请重启 Harness 后使用置顶。',
+        noteHostDegraded: '部分会话状态暂不可达，保留上次状态并自动重试。',
         title: '会话专注增强',
         summary: '置顶与状态徽标 · 已开 {n}/{total} 项',
         'group.title': '工作区内会话状态感知',
@@ -2662,24 +3348,46 @@ window.__ModuleLoader__.load({
         'row.autoFront': '工作区自动排序',
         'row.autoCollapse': '无关工作区自动折叠',
         'row.treeSessionsFirst': '树形下直属会话排在上方',
-        'row.badgeWaiting': '橙色问号',
-        'row.badgeError': '红色感叹号',
-        'row.badgeRunningDone': '旋转圈与绿色对勾',
+        'row.badgeWaiting': '工作区：橙色下排常亮、上排闪烁',
+        'row.badgeError': '工作区：红色砖墙崩塌',
+        'row.badgeRunningDone': '工作区：绿色小蛇绕圈与绿色实心',
         'hint.pinTop': '悬停显示图钉，钉住的工作区永远排最前；关闭后已钉名单仍保留。',
         'hint.autoFront': '有会话开始干活时，该工作区自动移到列表前面。',
         'hint.autoCollapse': '点开一个工作区时，其他展开着的工作区自动收起；它的上级和子级不受影响。',
         'hint.treeSessionsFirst': '按树结构分组时，工作区自身的会话优先排在子工作区前面，避免被误认成最底下一个子工作区内的会话。',
         'row.highlightCurrent': '高亮当前工作区',
         'hint.highlightCurrent': '把正在看的那个会话所属的工作区，连同它展开的会话一起框一圈边框，一眼定位。',
-        'hint.badgeWaiting': '里面有会话等你回答、等批准或等计划确认时显示。',
-        'hint.badgeError': '里面有会话异常中断时显示，会话行自己的圆点也一起变红；点开该会话后都消失。',
-        'hint.badgeRunningDone': '干活时显示旋转圈，跑完且你还没看时显示绿色对勾；在你眼前跑完的不算没看。完成与已读以主机的共享记录为准：另一端点开过，这一端的绿勾和绿点也会消失；本端没看到的完成，会话行圆点也会补上绿色。',
+        'hint.badgeWaiting': '里面有会话等你回答、等批准或等计划确认时显示：文件夹里下面一排橙色方块稳稳亮着，上面一排一明一暗地闪，表示这件事停在这里等你。图形直接顶替工作区前面的文件夹图标，名称位置不变。',
+        'hint.badgeError': '里面有会话异常中断时显示：文件夹里排成两排的红色方块像一堵墙，整排一起散落掉出、一块不剩，随后重新砌好、循环往复；会话行自己的小圆圈也一起变红，点开该会话后都消失。',
+        'hint.badgeRunningDone': '干活时像贪吃蛇在文件夹里绕圈：从左下角进场往右跑，沿右边上去、从上面往回、再从左边下来，一圈接一圈不停；跑完且你还没看时，文件夹里八个小方块全部实心亮着、完全不动。在你眼前跑完的不算没看。完成与已读以主机的共享记录为准：另一端点开过，这一端的绿色和会话行的绿点也会消失；本端没看到的完成，会话行圆点也会补上绿色。',
         note: '开关即时生效，无需刷新页面。',
         notePendingHost: '设置尚未与主机确认，恢复连接后会自动重试。',
         noteHostAuth: '主机拒绝了状态请求，请检查 DSH 登录或访问地址；恢复后会自动重试。',
         noteHostUnavailable: '暂时无法读取主机状态，正在自动重试。'
       },
       en: {
+        'state.waiting': 'Waiting for your answer, approval, or plan review',
+        'state.error': 'Session failed; open it to clear the reminder',
+        'state.running': 'Working', 'state.done': 'Finished with an unread reply', 'state.idle': 'Idle',
+        'native.new': 'New Session', 'native.untitled': 'Untitled',
+        'native.archivedGuard': 'This session is archived. Unarchive it before opening.',
+        'native.unarchive': 'Unarchive',
+        'action.pin': 'Pin to top', 'action.unpin': 'Unpin',
+        'action.favorite': 'Favorite this session', 'action.unfavorite': 'Remove favorite',
+        'action.favorites': 'Favorite sessions', 'action.removeFavorite': 'Remove this favorite',
+        'action.viewArchived': 'View Archived Sessions',
+        'error.archiveViewUnavailable': 'The archive-list entry is unavailable. Wait for the sidebar to reconnect and try again.',
+        'favorites.count': 'Favorite sessions ({n})',
+        'favorites.hiddenCount': '{n} favorite sessions are collapsed',
+        'favorites.empty': 'No favorite sessions yet. Use the star beside a session to favorite it.',
+        'error.favoriteSave': 'Favorite not saved yet. Your choice is kept and will retry after reconnecting.',
+        'error.pinSave': 'Pin could not be saved. The previous state was restored; try again.',
+        'error.sessionMissing': 'This session no longer exists. You can remove this favorite.',
+        'error.sessionUnknown': 'Cannot confirm whether this session is archived. Reconnect and try again.',
+        'error.openUnavailable': 'The native session entry is unavailable. Try again shortly.',
+        'error.openFailed': 'Cannot open this session. Try again shortly.',
+        'error.hostProtocol': 'Restart Harness to load the Host fix before pinning.',
+        noteHostDegraded: 'Some session states are unavailable. Keeping the last known state and retrying.',
         title: 'Session Focus Enhancer',
         summary: 'Pinning and status badges · {n}/{total} features on',
         'group.title': 'Session awareness inside workspaces',
@@ -2690,18 +3398,18 @@ window.__ModuleLoader__.load({
         'row.autoFront': 'Auto-sort workspaces',
         'row.autoCollapse': 'Auto-collapse unrelated workspaces',
         'row.treeSessionsFirst': 'Own sessions first in tree',
-        'row.badgeWaiting': 'Orange question mark',
-        'row.badgeError': 'Red exclamation mark',
-        'row.badgeRunningDone': 'Spinner and green check',
+        'row.badgeWaiting': 'Workspace: steady amber lower row, blinking upper row',
+        'row.badgeError': 'Workspace: falling red brick wall',
+        'row.badgeRunningDone': 'Workspace: green snake on a lap, and solid green',
         'hint.pinTop': 'Pinned workspaces always lead the list; turning this off keeps your pin list.',
         'hint.autoFront': 'A workspace with a running session moves to the front automatically.',
         'hint.autoCollapse': 'Opening a workspace collapses the other expanded ones; its parent and children stay put.',
         'hint.treeSessionsFirst': 'In tree view, show the workspace\'s own sessions above its nested sub-workspaces to avoid visual confusion.',
         'row.highlightCurrent': 'Highlight the current workspace',
         'hint.highlightCurrent': 'Outlines the workspace of the session you are looking at, together with its expanded sessions, so you can find it at a glance.',
-        'hint.badgeWaiting': 'Shows while a session waits for your answer, approval, or plan review.',
-        'hint.badgeError': 'Shows after a session fails, and turns that session row\'s own dot red; both clear when you open it.',
-        'hint.badgeRunningDone': 'Spins while working, turns into a green check when finished unread; a turn you watched finish does not count as unread. The shared Host ledger decides finished and read: opening a session on one client clears the green on the others, and a completion this page never watched still greens that session\'s dot.',
+        'hint.badgeWaiting': 'Shows while a session waits for your answer, approval, or plan review: the lower amber row stays lit and the upper row blinks. The session uses a question mark. It replaces the folder icon without moving the name.',
+        'hint.badgeError': 'Shows after a session fails: the red brick wall falls out of the folder and rebuilds. The session uses a red exclamation mark. Both reminders clear when you open it.',
+        'hint.badgeRunningDone': 'While working, a green snake runs laps inside the folder: in at the bottom-left, right along the bottom, up the right-hand side, back along the top and down the left, round and round. Once finished and unread the folder goes solid green and still. A turn you watched finish does not count as unread. The shared Host ledger decides finished and read: opening a session on one client clears the green on the others, and a completion this page never watched still greens that session\'s dot.',
         note: 'Changes apply immediately; no reload needed.',
         notePendingHost: 'Settings are not confirmed by the Host yet and will retry after reconnecting.',
         noteHostAuth: 'The Host rejected the status request. Check your DSH login and address; requests retry automatically.',
@@ -2910,7 +3618,8 @@ window.__ModuleLoader__.load({
     /** Nesting level of a row, read from the indent the page gives it. */
     function rowDepth(row) {
       try {
-        const raw = getComputedStyle(row).getPropertyValue('--dsh-workspace-indent');
+        const section = row.closest('div[class*="groupSection"]');
+        const raw = getComputedStyle(section || row).getPropertyValue('--dsh-workspace-indent');
         const px = parseFloat(raw);
         return Number.isFinite(px) ? Math.round(px / 12) : 0;
       } catch {
@@ -2940,20 +3649,48 @@ window.__ModuleLoader__.load({
       cancelExpansionPosition();
     }
 
+    /**
+     * The pocket the red bricks fall out of.
+     *
+     * One shared clip path, in the drawing's own 16-unit coordinates, mounted
+     * once and pointed at by every error badge. A brick that has fallen past the
+     * folder's bottom edge is clipped away by it — which is what lets the bricks
+     * fall out of sight instead of spilling over the row underneath, and what
+     * keeps the pocket empty once the wall is down.
+     */
+    function mountBadgeClip() {
+      if (document.getElementById(BADGE_CLIP_ID)) return;
+      const holder = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+      holder.setAttribute('data-dsh-order-clip','');
+      holder.setAttribute('width', '0');
+      holder.setAttribute('height', '0');
+      holder.setAttribute('aria-hidden', 'true');
+      holder.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden';
+      holder.innerHTML = `<defs><clipPath id="${BADGE_CLIP_ID}" clipPathUnits="userSpaceOnUse">`
+        + `<path d="${FOLDER_POCKET}"></path>`
+        + '</clipPath></defs>';
+      document.body.appendChild(holder);
+    }
+
     function apply(ctx) {
       rootCtx = ctx;
       document.querySelectorAll('.dsh-order-workspace-header').forEach(el => el.classList.remove('dsh-order-workspace-header'));
       // Older plugin versions did not remove their buttons when reloaded.
       document.querySelectorAll('.dsh-order-pin-btn, .dsh-order-state, .dsh-order-busy-badge, .dsh-order-star, .dsh-order-star-count, .dsh-order-star-filter, .dsh-order-session-mark').forEach(el => el.remove());
       document.querySelectorAll('.dsh-order-star-menu').forEach(el => el.remove());
+      // The shared pocket clip is re-mounted by apply(); drop a stale copy first.
+      document.querySelectorAll('[data-dsh-order-clip]').forEach(el => el.remove());
+      document.querySelectorAll('#' + BADGE_CLIP_ID).forEach(el => (el.closest('svg') || el).remove());
       // These marks live on the page's own containers: unmark, never remove.
       document.querySelectorAll('.dsh-order-current-group').forEach(el => el.classList.remove('dsh-order-current-group'));
       document.querySelectorAll('.dsh-order-open-group').forEach(el => el.classList.remove('dsh-order-open-group'));
+      document.querySelectorAll('.dsh-order-has-state').forEach(el => el.classList.remove('dsh-order-has-state'));
       document.body.classList.remove('dsh-order-sessions-first');
       // 1. Inject stylesheets: badges first, then the control panel's own rows.
       const styleEl = document.createElement('style');
       styleEl.textContent = CSS + PANEL_CSS;
       document.head.appendChild(styleEl);
+      mountBadgeClip();
 
       // 1b. Offer the feature switches on the Plugins detail page.
       mountControlPanel(ctx);
@@ -2963,10 +3700,18 @@ window.__ModuleLoader__.load({
       //    pins, the error ledger, and as the whole-status fallback.
       attachLiveStatus(ctx);
       updateStatus();
-      const timer = setInterval(() => {
-        if (typeof document !== 'undefined' && document.hidden && live) return;
-        updateStatus();
-      }, 2000);
+      const timer = setInterval(() => { if (!document.hidden) void updateStatus(); }, 2000);
+      const heartbeat = setInterval(() => {
+        if (!disposed) reportSeenSession(computeLiveStates().mainId || currentSessionIdFromDom(), false);
+      }, SEEN_HEARTBEAT_MS);
+      const onVisibility = () => {
+        reportSeenSession(computeLiveStates().mainId || currentSessionIdFromDom(), false, true);
+        if (!document.hidden) { void updateStatus(); refresh(); }
+      };
+      document.addEventListener('visibilitychange', onVisibility);
+      window.addEventListener('pagehide', releaseSeenLease);
+      window.addEventListener('beforeunload', releaseSeenLease);
+      document.addEventListener('keydown', onTreeKeydown, true);
 
       // Capture the user's target before the page toggles it. Fresh input ends
       // the short compensation, including scrollbar drags and touch scrolling.
@@ -2991,7 +3736,7 @@ window.__ModuleLoader__.load({
       });
       observer.observe(document.body, {
         childList: true, subtree: true, attributes: true,
-        attributeFilter: ['aria-expanded', 'aria-selected', 'data-row-key']
+        attributeFilter: ['aria-expanded', 'aria-selected', 'data-row-key', 'data-state']
       });
 
       // Clean up if context unwinds
@@ -3006,11 +3751,18 @@ window.__ModuleLoader__.load({
           document.removeEventListener('touchstart', onExpansionInput, true);
           document.removeEventListener('touchmove', onExpansionInput, true);
           clearInterval(timer);
+          clearInterval(heartbeat);
+          // Host routes may already have disappeared. Do not initiate a late
+          // keepalive POST; abandoned views expire, and client HMR reuses the id.
+          abortSeenRequests();
+          document.removeEventListener('visibilitychange', onVisibility);
+          window.removeEventListener('pagehide', releaseSeenLease);
+          window.removeEventListener('beforeunload', releaseSeenLease);
+          document.removeEventListener('keydown', onTreeKeydown, true);
           observer.disconnect();
-          if (unsubscribeLive) {
-            try { unsubscribeLive(); } catch {}
-          }
-          live = null;
+          restoreTreeSemantics();
+          for (const node of Array.from(ownedAttributes.keys())) restoreOwnedAttributes(node);
+          for (const key of Object.keys(live)) live[key] = null;
           rootCtx = null;
           styleEl.remove();
           document.querySelectorAll('.dsh-order-workspace-header').forEach(el => el.classList.remove('dsh-order-workspace-header'));
@@ -3019,7 +3771,11 @@ window.__ModuleLoader__.load({
           closeStarMenu();
           document.querySelectorAll('.dsh-order-current-group').forEach(el => el.classList.remove('dsh-order-current-group'));
           document.querySelectorAll('.dsh-order-open-group').forEach(el => el.classList.remove('dsh-order-open-group'));
-          document.body.classList.remove('dsh-order-sessions-first');
+          document.querySelectorAll('.dsh-order-has-state').forEach(el => el.classList.remove('dsh-order-has-state'));
+          document.body.classList.remove('dsh-order-sessions-first', 'dsh-order-tree-trays');
+          document.querySelectorAll('[data-dsh-order-tray-row]').forEach(el => el.removeAttribute('data-dsh-order-tray-row'));
+          document.querySelectorAll('.dsh-order-native-mark').forEach(clearNativeMark);
+          document.querySelectorAll('[data-dsh-order-clip], .dsh-order-action-feedback').forEach(el => el.remove());
         });
       }
     }

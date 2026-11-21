@@ -1,3 +1,10 @@
 node_modules/
 .DS_Store
 .backup-*/
+
+# Compatibility review reports, screenshots and local package tarballs stay out
+# of the repository: they are large binaries tied to one machine's test run, and
+# the tarballs would duplicate what npm publishes.
+compatibility-review/
+reports/
+*.tgz

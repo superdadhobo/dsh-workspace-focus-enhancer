@@ -1,6 +1,6 @@
 // Starts the actual installed DSH with a private temporary home and synthetic data.
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, realpath } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, realpath, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -21,32 +21,42 @@ export function request(port, path, { host = 'dsh.focus.test', cookie, body, raw
     q.end(raw ?? (body === undefined ? undefined : JSON.stringify(body)));
   });
 }
-export async function startNativeHost() {
+export async function startNativeHost({ extended = false, retainOnFailure = false, bundlePath = source } = {}) {
   const root=await realpath(await mkdtemp(join(tmpdir(),'dsh-focus-native-')));
   const home=join(root,'home'),profile=join(home,'profiles/focus-test');await mkdir(profile,{recursive:true,mode:0o700});
+  if (extended) { await mkdir(join(profile,'nested'),{recursive:true,mode:0o700}); await mkdir(join(root,'peer'),{mode:0o700}); }
   const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>!/^DSH_|TOKEN|PASSWORD|SECRET|KEY/i.test(k)));
   Object.assign(env,{DSH_HOME:home,CI:'true'});
-  let host,output='',exited=false;
-  async function close() {
-    if(host&&!exited) { host.kill('SIGTERM');await new Promise(resolve=>{host.once('exit',resolve);setTimeout(()=>{host.kill('SIGKILL');resolve();},5000).unref();}); }
-    await rm(root,{recursive:true,force:true});
+  let host,output='',exited=false,closing;
+  async function stopHost() {
+    if (!host || exited || host.exitCode !== null || host.signalCode !== null) return;
+    await new Promise(resolve => {
+      const timer=setTimeout(()=>host.kill('SIGKILL'),5000);timer.unref();
+      host.once('exit',()=>{clearTimeout(timer);resolve();});host.kill('SIGTERM');
+    });
+  }
+  function close() {
+    return closing ??= (async () => {
+      await stopHost();
+      // Only delete the exact private directory minted above, after the Host exits.
+      assert.equal(await realpath(root),root);
+      assert(root.split('/').at(-1).startsWith('dsh-focus-native-'));
+      await rm(root,{recursive:true,force:true});
+    })();
   }
   try {
     await writeFile(join(profile,'package.json'),JSON.stringify({name:'focus-test',private:true,dependencies:{},dsh:{profile:{bundles:['@deepseek-ai/dsh-base','@deepseek-ai/dsh-web-app']}}}));
     await writeFile(join(profile,'cordis.yml'),'[]\n');
     await writeFile(join(profile,'pnpm-workspace.yaml'),`packages:\n  - .\nnodeLinker: hoisted\nautoInstallPeers: false\nstoreDir: ${root}/store\n`);
     const fixture=join(root,'fixture.mjs');
-    await writeFile(fixture,`export const name='focus-fixture';export const inject=['webServer','connection','workspaceRegistry','sessions'];export async function apply(ctx){
-      const a=await ctx.workspaceRegistry.create(${JSON.stringify(root)},'Focus QA Parent');
-      const b=await ctx.workspaceRegistry.create(${JSON.stringify(profile)},'Focus QA Child');
-      const id='session-focus-qa';const session=ctx.sessions.get(id)||ctx.sessions.create(id,{meta:{cwd:${JSON.stringify(profile)}}});session.append('turn/start',{turn:1});session.append('user/message',{role:'user',source:{kind:'user'},content:[{type:'text',text:'Synthetic sidebar fixture; no agent is started.'}]},{surfaceOp:'append'});session.append('turn/end',{turn:1,reason:{kind:'completed'}});session.append('session/title',{title:'Focus QA Session',messageSeqs:[],source:{kind:'user'}});await b.attachSession(id);
-      ctx.effect(()=>ctx.webServer.register({kind:'exact',path:'/api/focus-fixture',handler(req,res){const denial=ctx.connection.requestRejection(req);if(denial){res.writeHead(denial);res.end();return;}res.writeHead(200,{'content-type':'application/json'});res.end(JSON.stringify({parent:a.id,child:b.id,session:id}));}}));
-    }`);
-    await writeFile(join(profile,'cordis.patch.yml'),`- id: connection\n  config:\n    trustedHosts: !!js "['dsh.focus.test', ...ctx.webStartup.trustedHosts]"\n- insert:\n    - id: focus-fixture\n      name: ${pathToFileURL(fixture).href}\n`);
-    await exec(cli,['plugin','--profile','focus-test','add','file:'+source,'--reporter=append-only'],{env,timeout:60000,maxBuffer:128*1024});
+    await writeFile(fixture,await readFile(new URL('./native-fixture.js',import.meta.url)));
+    await writeFile(join(profile,'cordis.patch.yml'),`- id: connection\n  config:\n    trustedHosts: !!js "['dsh.focus.test', ...ctx.webStartup.trustedHosts]"\n- id: session-persistence-jsonl\n  config: ${JSON.stringify({root:join(home,'sessions'),compression:'none'})}\n- insert:\n    - id: focus-fixture\n      name: ${pathToFileURL(fixture).href}\n      config: ${JSON.stringify({root,profile,extended})}\n`);
+    const bundleTarget=resolve(bundlePath),bundleStat=await stat(bundleTarget);
+    assert(bundleStat.isDirectory() || bundleStat.isFile(),'Native fixture needs a local directory or package archive');
+    await exec(cli,['plugin','--profile','focus-test','add','file:'+bundleTarget,'--reporter=append-only'],{env,timeout:60000,maxBuffer:128*1024});
     host=spawn(cli,['--profile','focus-test','--host','127.0.0.1','--port','0','--no-open'],{env,stdio:['ignore','pipe','pipe']});
     host.stdout.on('data',c=>{output=(output+c).slice(-100000);});host.stderr.on('data',c=>{output=(output+c).slice(-100000);});host.on('exit',()=>{exited=true;});
-    let port,token,cookie,fixtureData;
+    let port,token,cookie,fixtureData,lastProbe='No fixture response yet';
     const end=Date.now()+35000;
     while(Date.now()<end) {
       if(exited)throw Error('isolated Host exited: '+redact(output).slice(-2000));
@@ -57,12 +67,17 @@ export async function startNativeHost() {
           const login=await request(port,'/?token='+encodeURIComponent(token));cookie=login.headers['set-cookie']?.[0].split(';')[0];
           const r=await request(port,'/api/focus-fixture',{cookie});
           const status=await request(port,'/api/workspace-order/status',{cookie});
+          lastProbe=redact(JSON.stringify({fixture:{status:r.status,data:r.data,text:r.text.slice(0,1000)},plugin:{status:status.status,data:status.data}}));
           if(r.status===200&&status.status===200){fixtureData=r.data;break;}
-        }catch{}
+        }catch(error){lastProbe=String(error);}
       }
       await new Promise(resolve=>setTimeout(resolve,100));
     }
-    assert(fixtureData,'isolated plugin not ready: '+redact(output).slice(-3000));
-    return {root,home,profile,port,token,cookie,fixture:fixtureData,close};
-  } catch(error) { await close();throw error; }
+    assert(fixtureData,'isolated plugin not ready: '+lastProbe+'\n'+redact(output).slice(-3000));
+    return {root,home,profile,port,token,cookie,fixture:fixtureData,close,getOutput:()=>redact(output)};
+  } catch(error) {
+    if (retainOnFailure) { await stopHost(); console.error('Retained synthetic diagnostic home: '+root); }
+    else await close();
+    throw error;
+  }
 }
