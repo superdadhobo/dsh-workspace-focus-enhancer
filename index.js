@@ -12,7 +12,8 @@
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { readFile, rename, mkdir, open } from 'node:fs/promises';
+import { readFile, rename, mkdir, open, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 
 export const name = 'workspace-order';
 export const inject = ['workspaceRegistry', 'webServer', 'agents', 'connection'];
@@ -37,6 +38,27 @@ const STORAGE_DIR = join(DSH_HOME, 'storages');
 const STORAGE_FILE = join(STORAGE_DIR, 'workspace-pins.json');
 const SETTINGS_FILE = join(STORAGE_DIR, 'workspace-order-settings.json');
 const FAVORITES_FILE = join(STORAGE_DIR, 'workspace-favorites.json');
+
+/**
+ * Sessions whose finished reply the user has not opened yet.
+ *
+ * The live sets below are rebuilt only from events this process sees, so they
+ * are empty after a Harness restart. That is correct for a live status read but
+ * wrong for the user's memory of "I still have something to read", so the same
+ * fact is also written to disk here and merged back at startup.
+ *
+ * Only completions observed live are recorded: this file is never seeded from
+ * the session logs, because doing so would mark every historical reply unread
+ * at once.
+ */
+const UNREAD_FILE = join(STORAGE_DIR, 'workspace-unread.json');
+
+/**
+ * Upper bound on remembered completions. The list is pruned by session
+ * existence on every successful catalog read, so this only caps the pathological
+ * case of thousands of finished-and-never-opened Sessions. Oldest go first.
+ */
+const UNREAD_MAX = 2000;
 
 /** Feature switches, with everything on by default. */
 const DEFAULT_SETTINGS = Object.freeze({
@@ -147,6 +169,12 @@ export function apply(ctx) {
   let applyingOrder = false;
   let lastReconciled = null;
   let mutationTask = Promise.resolve();
+  /**
+   * The most recent ledger write, so teardown (and a status read that must
+   * observe its own write) can await it instead of racing the disk.
+   */
+  let unreadWrite = Promise.resolve();
+
   const pendingBodies = new Set();
   const pendingResponses = new Set();
 
@@ -207,6 +235,11 @@ export function apply(ctx) {
     await ready.catch(() => {});
     await Promise.allSettled([mutationTask, reorderTask, queryTask]);
     await reorderTask.catch(() => {});
+    // Drain the ledger writer too. Cordis only starts a replacement after this
+    // resolves, and a test fixture deletes the directory right after: a write
+    // still in flight would either be lost or fail on a path that no longer
+    // exists. Waiting here makes "plugin stopped" mean "nothing is writing".
+    await unreadWrite.catch(() => {});
   }, 'workspace-order: pending work cleanup');
 
   /** Pinned workspace IDs in display order. */
@@ -232,6 +265,20 @@ export function apply(ctx) {
 
   /** Sessions whose last turn finished with a reply the user has not opened yet. */
   const unreadSessions = new Set();
+
+  /**
+   * The durable half of {@link unreadSessions}: completions remembered across
+   * Harness restarts, oldest first. Kept as a separate list so the in-memory set
+   * can stay "what this process observed" while the status payload reports both.
+   */
+  let persistedUnread = [];
+
+  /**
+   * Remembered ids a complete listing has already failed to show once. A second
+   * consecutive miss confirms the Session is really gone; seeing it again clears
+   * the suspicion.
+   */
+  const pruneSeenMissing = new Set();
 
   // Each browser instance owns a renewable, independent reading lease. A
   // vanished/hidden tab stops counting without overwriting any other reader.
@@ -451,6 +498,45 @@ export function apply(ctx) {
           openApprovals.delete(id);
           openQuestions.delete(id);
         }
+        // The remembered completions follow the same rule, and only on a
+        // complete listing: a session deleted outside DSH must not leave a green
+        // check that can never be cleared, while a failed read must not erase
+        // memories it merely could not verify.
+        //
+        // Only locally logged sessions can be judged this way. An external
+        // subagent's Session lives with its own provider and never appears in
+        // this Host's catalog, so its absence proves nothing and it is kept.
+        //
+        // Deletion is confirmed over two consecutive listings. A single read can
+        // legitimately be missing a Session — the persistence backend may still
+        // be replaying its index, a Session may be mid-creation, or another
+        // process may hold it. Dropping on the first miss would forget a reply
+        // the user has not read yet, the opposite of what this file is for.
+        const external = new Set();
+        for (const run of subagentRuns.values()) if (!run.local) external.add(run.id);
+        let dropped = false;
+        for (const id of [...unreadSessions]) {
+          if (ids.has(id) || external.has(id)) continue;
+          unreadSessions.delete(id);
+          dropped = true;
+        }
+        const survivors = [];
+        for (const id of persistedUnread) {
+          if (ids.has(id) || external.has(id)) {
+            pruneSeenMissing.delete(id);
+            survivors.push(id);
+          } else if (pruneSeenMissing.has(id)) {
+            // Missing on two consecutive complete listings: really gone.
+            pruneSeenMissing.delete(id);
+            dropped = true;
+          } else {
+            // First miss: keep it and wait for one more listing to agree.
+            pruneSeenMissing.add(id);
+            survivors.push(id);
+          }
+        }
+        persistedUnread = survivors;
+        if (dropped) void saveUnread(persistedUnread);
       }
       stateRead = { status: catalog === 'ok' && !failed.size && !unavailable.size ? 'ok' : 'degraded',
         catalog, failedSessionIds: [...failed], unavailableProjectionSessionIds: [...unavailable] };
@@ -481,8 +567,12 @@ export function apply(ctx) {
     if (reason === 'error') {
       erroredSessions.add(sessionId);
       unreadSessions.delete(sessionId);
+      forgetUnread(sessionId);
     } else if (reason === 'completed' && reply && !erroredSessions.has(sessionId) && !isBeingRead(root)) {
       unreadSessions.add(sessionId);
+      // Remember it on disk too: this process may restart before the user reads
+      // the reply, and the green check should still be there afterwards.
+      rememberUnread(sessionId);
     }
   }
 
@@ -541,11 +631,20 @@ export function apply(ctx) {
    * the previous document intact instead of a truncated file the loader would
    * silently reset to defaults. Mode 0600 matches every other file the storage
    * backend keeps in this directory.
+   *
+   * The temp name carries a per-write counter, not just the process id: two
+   * writes of the same document can overlap (a burst of completions, or two
+   * plugin instances in one process), and a shared temp path let the first
+   * rename consume the file the second was about to rename — the loser then
+   * failed with ENOENT and its update was silently dropped.
    */
+  let tempCounter = 0;
   async function saveJson(file, value) {
     await mkdir(STORAGE_DIR, { recursive: true });
     const body = `${JSON.stringify(value, null, 2)}\n`;
-    const tmp = `${file}.${process.pid}.tmp`;
+    // Unique per write across processes AND across plugin instances in one
+    // process: tests and HMR both mount several copies over the same directory.
+    const tmp = `${file}.${process.pid}.${++tempCounter}.${randomUUID()}.tmp`;
     const handle = await open(tmp, 'w', 0o600);
     try {
       await handle.writeFile(body, 'utf8');
@@ -553,7 +652,15 @@ export function apply(ctx) {
     } finally {
       await handle.close();
     }
-    await rename(tmp, file);
+    try {
+      await rename(tmp, file);
+    } catch (error) {
+      // The storage directory can disappear under a write — a test fixture or a
+      // user cleaning the profile. Drop the orphan temp file and let the caller
+      // decide; a lost cache write must never surface as a status failure.
+      await rm(tmp, { force: true }).catch(() => {});
+      throw error;
+    }
   }
 
   /**
@@ -602,6 +709,84 @@ export function apply(ctx) {
    */
   async function saveSettings(next) {
     await saveJson(SETTINGS_FILE, next);
+  }
+
+  /**
+   * Read the completions remembered across restarts.
+   *
+   * A missing or unreadable file means "nothing remembered", never an error: a
+   * plugin that refused to start because of its own optional cache would be
+   * worse than one that forgot a few green checks.
+   * @returns the remembered session ids, oldest first.
+   */
+  async function loadUnread() {
+    try {
+      const content = await readFile(UNREAD_FILE, 'utf8');
+      const parsed = JSON.parse(content);
+      if (!Array.isArray(parsed.unreadIds)) return [];
+      return parsed.unreadIds.filter(id => typeof id === 'string' && id);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Persist the remembered completions.
+   *
+   * Failures are logged and swallowed on purpose: this is a memory aid, not a
+   * source of truth, and a full disk must not break pinning or the status route.
+   * @param ids - session ids to remember, oldest first.
+   */
+  function saveUnread(ids) {
+    // Serialize writes and remember the tail, so a later read observes the last
+    // committed order rather than an interleaving of two saves.
+    unreadWrite = unreadWrite.catch(() => {}).then(async () => {
+      try {
+        await saveJson(UNREAD_FILE, { unreadIds: ids });
+      } catch (error) {
+        console.warn('[workspace-order] Could not save the unread ledger:', error);
+      }
+    });
+    return unreadWrite;
+  }
+
+  /**
+   * The current remembered-completion order: the persisted order first, then
+   * anything added during this run, without duplicates. Oldest entries lead so
+   * {@link UNREAD_MAX} trimming drops the least recently interesting ones.
+   * @returns session ids.
+   */
+  function unreadLedger() {
+    const seen = new Set();
+    const out = [];
+    for (const id of [...persistedUnread, ...unreadSessions]) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+    return out;
+  }
+
+  /**
+   * Remember one completion and write the ledger, keeping the newest
+   * {@link UNREAD_MAX} entries.
+   * @param sessionId - the session whose reply is now unread.
+   */
+  function rememberUnread(sessionId) {
+    persistedUnread = unreadLedger();
+    if (!persistedUnread.includes(sessionId)) persistedUnread.push(sessionId);
+    if (persistedUnread.length > UNREAD_MAX) persistedUnread = persistedUnread.slice(-UNREAD_MAX);
+    return saveUnread(persistedUnread);
+  }
+
+  /**
+   * Forget one completion and write the ledger.
+   * @param sessionId - the session whose reply was read, or is gone.
+   */
+  function forgetUnread(sessionId) {
+    if (!persistedUnread.includes(sessionId)) return;
+    persistedUnread = persistedUnread.filter(id => id !== sessionId);
+    return saveUnread(persistedUnread);
   }
 
   /**
@@ -745,7 +930,10 @@ export function apply(ctx) {
     const busy = getBusyWorkspaces(all, runningRoots);
     reconcile(all);
     const waiting = waitingSessions();
-    const unread = attributedSessions(unreadSessions);
+    // Both halves of the fact: what this process watched finish, and what it
+    // remembered from an earlier run. A reply the user has not read must keep
+    // its green check across a restart, so the durable list is reported too.
+    const unread = attributedSessions(new Set([...unreadSessions, ...persistedUnread]));
     const errors = attributedSessions(erroredSessions);
     const sessionTitles = Object.fromEntries([...observedState].filter(([, state]) => typeof state.title === 'string' && state.title.trim()).map(([id, state]) => [id, state.title]));
     // The route's await can yield once after the query publication barrier.
@@ -887,8 +1075,14 @@ export function apply(ctx) {
   });
 
   // A failed initial ordering write must not make all reads fail permanently.
-  const ready = Promise.all([loadPins(), loadSettings(), loadFavorites()])
-    .then(() => disposed ? undefined : performReorder())
+  const ready = Promise.all([loadPins(), loadSettings(), loadFavorites(), loadUnread()])
+    .then(loaded => {
+      // The remembered completions are the fourth load; restore them before the
+      // first status read so a page that connects immediately sees them.
+      persistedUnread = loaded[3];
+      if (disposed) return undefined;
+      return performReorder();
+    })
     .catch(err => {
       lastReconciled = null;
       console.warn('[workspace-order] Startup reorder error:', err);
@@ -904,6 +1098,9 @@ export function apply(ctx) {
       if (!turnFacts.has(sessionId)) turnFacts.set(sessionId, { reply: false, failed: false });
       erroredSessions.delete(sessionId);
       unreadSessions.delete(sessionId);
+      // A new run supersedes the previous reply: the user is interacting with
+      // this session again, so its remembered completion must not outlive it.
+      forgetUnread(sessionId);
     } else activeSessions.delete(sessionId);
     getBusyWorkspaces(ctx.workspaceRegistry.list() || []);
     requestReorder();
@@ -927,6 +1124,7 @@ export function apply(ctx) {
       openApprovals.delete(sessionId);
       erroredSessions.delete(sessionId);
       unreadSessions.delete(sessionId);
+      forgetUnread(sessionId);
     } else if (event.type === 'assistant/message') {
       const facts = turnFacts.get(sessionId);
       if (facts && (facts.turn === undefined || facts.turn === data.turn) && !data.interrupted && hasReply(data.message)) facts.reply = true;
@@ -965,6 +1163,9 @@ export function apply(ctx) {
     sessionHeaderOf(sessionId);
     erroredSessions.add(sessionId);
     unreadSessions.delete(sessionId);
+    // A failure supersedes the previous reply, so the remembered completion is
+    // no longer something the user has waiting for them.
+    forgetUnread(sessionId);
     const facts = turnFacts.get(sessionId);
     if (facts) facts.failed = true;
   });
@@ -983,6 +1184,7 @@ export function apply(ctx) {
     subagentRuns.set(info.runId, { id: info.id, local: info.local === true, running: true });
     erroredSessions.delete(info.id);
     unreadSessions.delete(info.id);
+    forgetUnread(info.id);
     requestReorder();
   });
   ctx.on('subagent/end', info => {
@@ -1071,6 +1273,16 @@ export function apply(ctx) {
           const clearSeen = seen => {
             for (const source of erroredSessions) if (rootSessionOf(source) === seen || source === seen) erroredSessions.delete(source);
             for (const source of unreadSessions) if (rootSessionOf(source) === seen || source === seen) unreadSessions.delete(source);
+            // The durable memory has to be cleared by the same rule, or the
+            // green check would come back after the next restart for a reply the
+            // user has already read.
+            let dropped = false;
+            persistedUnread = persistedUnread.filter(id => {
+              const same = rootSessionOf(id) === seen || id === seen;
+              if (same) dropped = true;
+              return !same;
+            });
+            if (dropped) void saveUnread(persistedUnread);
           };
           if (sessionId === null || typeof sessionId === 'string') {
             const seen = sessionId || null;

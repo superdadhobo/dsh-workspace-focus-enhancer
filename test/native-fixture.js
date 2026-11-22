@@ -129,6 +129,23 @@ export async function apply(ctx, config) {
     await ctx.sessions.flush(blank.session);
     blank.detach();
     await blankWriter.close();
+    // A Session that survives a Host restart: its log is written through the real
+    // persistence service, so a NEW process lists it. Used to verify that a
+    // remembered completion is still there after the plugin reloads.
+    fixture.persisted = 'session-focus-persisted';
+    const persisted = create(fixture.persisted, profile, 'Persisted conversation');
+    // Write the log FIRST, then open the writer: creating it against an empty
+    // Session makes the backend expect seq 0 while the Session already holds
+    // earlier events, which the append path rejects as a mismatch.
+    begin(persisted);
+    finish(persisted);
+    await ctx.sessions.flush(persisted.session);
+    // Keep the writer open for the lifetime of this fixture: the test drives
+    // further turns, and every append must reach the real log so a NEW Host
+    // process can list this Session after a restart.
+    const persistedWriter = await ctx.sessionPersistence.create(persisted.session.header);
+    ctx.effect(() => () => persistedWriter.close());
+    await child.attachSession(fixture.persisted);
     fixture.approval = 'session-focus-approval';
     const approval = create(fixture.approval, `${profile}/nested`, 'Approval pending before plugin activation');
     begin(approval);

@@ -249,6 +249,117 @@ test('a live turn boundary retires an approval the interrupted turn left open', 
   assert.deepEqual((await h.call()).body.waitingSessions, [], 'the ended turn retires the live ask');
 });
 
+test('a finished reply is still unread after the Host restarts', async t => {
+  const h = await harness(t);
+  // A turn completes with a visible reply while the user is elsewhere.
+  turn(h, 'sc');
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc'], 'the live process knows');
+  // The ledger write is asynchronous; let it land before the restart.
+  await settle();
+  // Restart the plugin: the in-memory set is rebuilt from scratch, so only the
+  // file on disk can carry the fact across.
+  await h.restart();
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc'], 'the restart remembered it');
+});
+
+test('reading a reply clears the remembered completion on disk too', async t => {
+  const h = await harness(t);
+  turn(h, 'sc');
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc']);
+  // The user opens the session; the page reports it as seen.
+  const seen = await h.call('clear-error', { method: 'POST', body: { sessionId: 'sc', viewId: 'view-1' } });
+  assert.equal(seen.status, 200);
+  assert.deepEqual((await h.call()).body.unreadSessions, []);
+  await settle();
+  await h.restart();
+  assert.deepEqual((await h.call()).body.unreadSessions, [], 'a read reply must not come back after a restart');
+});
+
+test('a failure or a new run retires the remembered completion', async t => {
+  const h = await harness(t);
+  turn(h, 'sc');
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc']);
+  h.emit('api-session/error', 'sc');
+  await settle();
+  await h.restart();
+  assert.deepEqual((await h.call()).body.unreadSessions, [], 'a failure is not a waiting reply');
+
+  turn(h, 'sc');
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc']);
+  // The user sends another message: the previous reply is no longer "new".
+  h.emit('api-session/status', 'sc', true);
+  await settle();
+  await h.restart();
+  assert.deepEqual((await h.call()).body.unreadSessions, [], 'a new run supersedes the old reply');
+});
+
+test('a gone session is dropped only after two complete listings agree', async t => {
+  const h = await harness(t);
+  turn(h, 'sc');
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc']);
+  // The session disappears from the catalog. The fixture derives its listing from
+  // the workspaces too, so the workspace must forget it as well — exactly what a
+  // real deletion does.
+  h.sessions.length = 0;
+  h.workspaces[2].sessionIds = [];
+  // One miss is not proof: the backend may still be replaying its index.
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc'], 'one miss keeps the memory');
+  // A second consecutive complete listing confirms the deletion.
+  assert.deepEqual((await h.call()).body.unreadSessions, [], 'the second miss drops it');
+  await settle();
+  await h.restart();
+  assert.deepEqual((await h.call()).body.unreadSessions, [], 'and it is gone from disk as well');
+});
+
+test('a session that reappears clears its pending deletion', async t => {
+  const h = await harness(t);
+  turn(h, 'sc');
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc']);
+  // Miss once, then reappear: the suspicion must reset, not accumulate.
+  h.sessions.length = 0;
+  h.workspaces[2].sessionIds = [];
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc']);
+  h.sessions.push({ id: 'sc', header: { id: 'sc' }, events: [] });
+  h.workspaces[2].sessionIds = ['sc'];
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc'], 'seeing it again keeps it');
+  // And it must take two fresh misses again before it can be dropped.
+  h.sessions.length = 0;
+  h.workspaces[2].sessionIds = [];
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc'], 'the count restarted');
+});
+
+test('a failed catalog read keeps the remembered completions', async t => {
+  const h = await harness(t);
+  turn(h, 'sc');
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc']);
+  // A broken read must not be mistaken for "the session is gone".
+  h.query.listError = true;
+  const degraded = await h.call();
+  assert.equal(degraded.status, 503);
+  await settle();
+  await h.restart();
+  assert.deepEqual((await h.call()).body.unreadSessions, ['sc'], 'a read failure is not evidence of deletion');
+});
+
+test('the remembered completions are capped so the file cannot grow without bound', async t => {
+  const h = await harness(t);
+  // Seed the ledger beyond the cap directly, then complete one more turn so the
+  // plugin rewrites it. Distinct ids are required: one id is one entry.
+  const { writeFile, readFile, mkdir } = await import('node:fs/promises');
+  const { join } = await import('node:path');
+  const dir = join(h.root, 'storages');
+  await mkdir(dir, { recursive: true });
+  const seeded = Array.from({ length: 2100 }, (_, i) => `seed-${i}`);
+  await writeFile(join(dir, 'workspace-unread.json'), JSON.stringify({ unreadIds: seeded }));
+  await h.restart();
+  turn(h, 'sc');
+  await settle();
+  const raw = JSON.parse(await readFile(join(dir, 'workspace-unread.json'), 'utf8'));
+  assert.ok(raw.unreadIds.length <= 2000, 'the file stays bounded, got ' + raw.unreadIds.length);
+  assert.ok(raw.unreadIds.includes('sc'), 'the newest completion survives the trim');
+  assert.ok(!raw.unreadIds.includes('seed-0'), 'the oldest entries are the ones dropped');
+});
+
 test('a subagent still working keeps its parent workspace busy', async t => {
   const h=await harness(t);
   // The child Session is a log of its own: no workspace lists it, and the parent
@@ -276,6 +387,14 @@ function turn(h, id, { reason = 'completed', content = [{ type: 'text', text: 'A
   h.emit('api-session/status', id, false);
 }
 function deferred() { let resolve;const promise = new Promise(r => { resolve = r; });return { promise, resolve }; }
+/** Let queued filesystem writes land before a restart reads them back. */
+async function settle() {
+  // setImmediate alone cannot outlast real disk I/O; give the write chain a
+  // few real turns of the event loop plus a short timer.
+  for (let i = 0; i < 5; i += 1) await new Promise(r => setImmediate(r));
+  await new Promise(r => setTimeout(r, 60));
+  for (let i = 0; i < 5; i += 1) await new Promise(r => setImmediate(r));
+}
 
 test('a completed turn already in the log is not reported as unread on a cold start', async t => {
   const h = await harness(t);

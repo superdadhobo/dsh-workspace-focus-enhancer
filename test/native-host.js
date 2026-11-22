@@ -21,10 +21,14 @@ export function request(port, path, { host = 'dsh.focus.test', cookie, body, raw
     q.end(raw ?? (body === undefined ? undefined : JSON.stringify(body)));
   });
 }
-export async function startNativeHost({ extended = false, retainOnFailure = false, bundlePath = source } = {}) {
-  const root=await realpath(await mkdtemp(join(tmpdir(),'dsh-focus-native-')));
+export async function startNativeHost({ extended = false, retainOnFailure = false, bundlePath = source, reuseRoot = undefined } = {}) {
+  // `reuseRoot` starts a second Host process over an existing fixture root, which
+  // is how a real restart (same DSH_HOME, new process) is reproduced.
+  const root = reuseRoot === undefined
+    ? await realpath(await mkdtemp(join(tmpdir(),'dsh-focus-native-')))
+    : await realpath(reuseRoot);
   const home=join(root,'home'),profile=join(home,'profiles/focus-test');await mkdir(profile,{recursive:true,mode:0o700});
-  if (extended) { await mkdir(join(profile,'nested'),{recursive:true,mode:0o700}); await mkdir(join(root,'peer'),{mode:0o700}); }
+  if (extended) { await mkdir(join(profile,'nested'),{recursive:true,mode:0o700}); await mkdir(join(root,'peer'),{recursive:true,mode:0o700}); }
   const env=Object.fromEntries(Object.entries(process.env).filter(([k])=>!/^DSH_|TOKEN|PASSWORD|SECRET|KEY/i.test(k)));
   Object.assign(env,{DSH_HOME:home,CI:'true'});
   let host,output='',exited=false,closing;
@@ -74,7 +78,7 @@ export async function startNativeHost({ extended = false, retainOnFailure = fals
       await new Promise(resolve=>setTimeout(resolve,100));
     }
     assert(fixtureData,'isolated plugin not ready: '+lastProbe+'\n'+redact(output).slice(-3000));
-    return {root,home,profile,port,token,cookie,fixture:fixtureData,close,getOutput:()=>redact(output)};
+    return {root,home,profile,port,token,cookie,fixture:fixtureData,close,stop:stopHost,getOutput:()=>redact(output)};
   } catch(error) {
     if (retainOnFailure) { await stopHost(); console.error('Retained synthetic diagnostic home: '+root); }
     else await close();
