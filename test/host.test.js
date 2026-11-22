@@ -277,6 +277,22 @@ function turn(h, id, { reason = 'completed', content = [{ type: 'text', text: 'A
 }
 function deferred() { let resolve;const promise = new Promise(r => { resolve = r; });return { promise, resolve }; }
 
+test('a completed turn already in the log is not reported as unread on a cold start', async t => {
+  const h = await harness(t);
+  // A turn that finished before this Host started wrote its own reply, but no
+  // live event reaches the process for it. The Host only ever learns about
+  // completion from the live stream, so it must not invent an unread mark for
+  // history: the user may already have read it, and nothing would retire it.
+  h.sessions.push({ id: 'sc', header: { id: 'sc' }, events: [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: 'Read long ago' }] } } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } },
+  ] });
+  const state = (await h.call()).body;
+  assert.deepEqual(state.unreadSessions, [], 'history is not a fresh completion');
+  assert.deepEqual(state.runningSessions, []);
+});
+
 test('unread requires a watched completed turn and a real, non-interrupted reply', async t => {
   const h = await harness(t);
   for (const reason of ['aborted','blocked','error','max-tokens','interrupted']) {

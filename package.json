@@ -1,6 +1,6 @@
 {
   "name": "dsh-workspace-focus-enhancer",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "engines": {
     "dsh": ">=0.2.2-rc.5"
   },

@@ -2367,6 +2367,26 @@ window.__ModuleLoader__.load({
         || archivedSessionsKnown && hostFresh() && !hostError;
     }
     function liveSessionStatus(sessionId) { return statusSnapshot().get(sessionId); }
+    /**
+     * Whether a native `done` dot is a completion this client should honour.
+     *
+     * The page paints its own green check from a running -> stopped edge it
+     * watched. That edge is gone after a reload, and the Host rebuilds its unread
+     * ledger only from live `turn/end` events, so on a cold start neither source
+     * remembers the reply. The page's green is then the only surviving evidence,
+     * and it must be kept rather than replaced with idle.
+     *
+     * The one case that does retire it is positive evidence of a read: this
+     * client had the session in its unread set and the Host then dropped it.
+     * @param sessionId - the session whose dot is being read.
+     * @returns true when a native completion still stands.
+     */
+    function nativeCompletionStands(sessionId) {
+      if (localDoneCounts(sessionId)) return true;
+      // Retired means: seen as unread here, then withdrawn by the shared ledger.
+      return !retiredLocalUnread.has(sessionId);
+    }
+
     function sessionState(row, sessionId, roots) {
       if (isSessionArchived(sessionId)) return undefined;
       const dot = pageStatusDot(row);
@@ -2379,6 +2399,8 @@ window.__ModuleLoader__.load({
       if (!viewed && (native === 'error' || erroredSessionSet.has(sessionId) || clientErrored.has(sessionId))) candidates.push('error');
       if (native === 'ongoing' || runningSessionSet.has(sessionId) || status?.running) candidates.push('running');
       if (roots?.has(sessionId) && (!viewed || !['error','done'].includes(roots.get(sessionId)))) candidates.push(roots.get(sessionId));
+      // A native green is a real completion fact of the page, not a fallback.
+      if (!viewed && native === 'done' && nativeCompletionStands(sessionId)) candidates.push('done');
       if (!viewed && localDoneCounts(sessionId)) candidates.push('done');
       return candidates.filter(stateAllowed).sort((a,b) => stateRank(a) - stateRank(b))[0];
     }
@@ -2394,9 +2416,19 @@ window.__ModuleLoader__.load({
       if (dot) {
         const native = dot.getAttribute('data-state');
         // Preserve native states controlled by a disabled switch unless another
-        // enabled state won. Retire old native completion only if its own switch
-        // is enabled; this is not a global hiding rule.
-        const retired = !state && settings.badgeRunningDone && native === 'done' && !localDoneCounts(sessionId);
+        // enabled state won. Retire an old native completion only when THIS
+        // client holds positive evidence that the reply was read.
+        //
+        // An absent ledger entry is not that evidence. The Host rebuilds its
+        // unread ledger only from live `turn/end` events, so after a Harness
+        // restart — or while a status poll is failing — it simply has no opinion
+        // about a session. Retiring on "the Host did not list it" therefore
+        // replaced a green check the page itself had just painted with a grey
+        // idle mark, destroying the user's only completion fact. Only a session
+        // this client had seen as unread and then watched the Host drop is
+        // retired.
+        const retired = !state && settings.badgeRunningDone && native === 'done'
+          && retiredLocalUnread.has(sessionId);
         if (dot.tagName?.toLowerCase() === 'svg') {
           if (!state && !retired) { clearNativeMark(dot); mark?.remove(); return; }
           // Read CSS dimensions before hiding. A rotating SVG's bounding box can

@@ -719,3 +719,77 @@ test('favorite navigation invokes native service owner and leaves the sole main 
   owner.startSession(); assert.equal(owner.mainReference.id,'native-blank'); assert.equal(holders.get('qa'),0); assert.equal(holders.get('native-blank'),1);
   h.dispose(); assert.equal(owner.mainReference.id,'native-blank'); assert.equal(holders.get('native-blank'),1,'plugin disposal does not own or release global main view');
 });
+
+test('a Host-affirmed completion reaches both the session row and the workspace folder', async t => {
+  // The page's own store only learns completion from a running -> stopped edge
+  // it personally watched. A reply that finished in another window, or before
+  // this page loaded, has no such edge here, so the Host ledger is the only
+  // source — and it must still reach the green mark.
+  let f; const h = await harness(t, { setup(h) {
+    f = addTree(h);
+    // After a turn completes the native dot is 'done', not 'ongoing'.
+    f.sp.dot.setAttribute('data-state', 'done');
+    h.setPayload({ unread:['parent'], unreadSessions:['sp'], owners:{sp:'parent'} });
+  } });
+  await h.plugin.test.updateStatus();
+  assert.equal(h.plugin.test.localDoneCounts('sp'), true, 'a Host-affirmed unread reply is a completion');
+  h.plugin.test.refresh();
+  assert.equal(f.sp.dot.getAttribute('data-dsh-order-state'), 'done', 'the session row wears the done mark');
+  const glyph = f.parent.row.querySelector('.dsh-order-state');
+  assert.equal(glyph?.getAttribute('data-state'), 'done', 'the workspace folder shows the done state');
+});
+
+test('a live completion on an open page reaches the green mark', async t => {
+  let f; const h = await harness(t, { setup(h) { f = addTree(h); } });
+  h.services.sessions.list.set({ phase:'ready', state:'ready', byId:{ sp:{id:'sp',title:'Parent Session'} }, projectionsBySession:{} });
+  // The turn runs, then stops with a real reply; the Host then affirms it.
+  h.services.uiSession.sessionStatus.set(new Map([['sp',{running:true}]]));
+  h.plugin.test.refresh(); await h.flush();
+  h.services.uiSession.sessionStatus.set(new Map([['sp',{running:false,completionUnread:true}]]));
+  f.sp.dot.setAttribute('data-state','done');
+  h.setPayload({ unread:['parent'], unreadSessions:['sp'], owners:{sp:'parent'} });
+  await h.plugin.test.updateStatus();
+  h.plugin.test.refresh();
+  assert.equal(h.plugin.test.localDoneCounts('sp'), true, 'the watched completion is confirmed');
+  assert.equal(f.sp.dot.getAttribute('data-dsh-order-state'), 'done');
+  assert.equal(f.parent.row.querySelector('.dsh-order-state')?.getAttribute('data-state'), 'done');
+});
+
+test('a completion this client watched being read retires its green', async t => {
+  // The shared ledger is what makes "read on the phone" clear the desktop's
+  // green. The retirement needs positive evidence: this client first held the
+  // reply as unread, then saw the Host withdraw it. An empty ledger alone is not
+  // that evidence (see the reload test below).
+  let f; const h = await harness(t, { setup(h) { f = addTree(h); f.sp.dot.setAttribute('data-state','done'); } });
+  h.services.sessions.list.set({ phase:'ready', state:'ready', byId:{ sp:{id:'sp'} }, projectionsBySession:{} });
+  h.services.uiSession.sessionStatus.set(new Map([['sp',{running:false,completionUnread:true}]]));
+  // 1. The Host affirms the reply: this client now holds it as unread.
+  h.setPayload({ unread:['parent'], unreadSessions:['sp'], owners:{sp:'parent'} });
+  await h.plugin.test.updateStatus();
+  assert.equal(h.plugin.test.localDoneCounts('sp'), true, 'the reply is held as unread');
+  // 2. Another client reads it; the Host withdraws the mark and this page follows.
+  h.setPayload({ unread:[], unreadSessions:[], owners:{sp:'parent'} });
+  await h.plugin.test.updateStatus();
+  h.plugin.test.refresh();
+  assert.equal(h.plugin.test.localDoneCounts('sp'), false, 'the shared ledger retired it');
+  assert.equal(f.parent.row.querySelector('.dsh-order-state'), null, 'no green folder once read');
+});
+
+test('a native green survives a page reload the Host never saw as a live completion', async t => {
+  // The native page paints its own green check for a completed turn. After a
+  // reload (or a Harness restart) this page saw no running -> stopped edge, and
+  // the Host has no live event either, so it reports an empty unread ledger.
+  // The native green is still the user's only completion fact and must stay.
+  let f; const h = await harness(t, { setup(h) {
+    f = addTree(h);
+    f.sp.dot.setAttribute('data-state', 'done');
+    h.setPayload({ unread: [], unreadSessions: [], owners: { sp: 'parent' } });
+  } });
+  await h.plugin.test.updateStatus();
+  h.plugin.test.refresh();
+  assert.equal(f.sp.dot.getAttribute('data-dsh-order-state'), 'done',
+    'the page\'s own completion must not be replaced with idle');
+  assert.equal(f.parent.row.querySelector('.dsh-order-state')?.getAttribute('data-state'), 'done',
+    'the workspace folder keeps the completion too');
+});
+
