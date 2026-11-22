@@ -4,9 +4,24 @@ dsh工作区专注增强——让 DeepSeek Harness 侧边栏的工作区列表�
 
 > **一句话介绍**：正在干活的工作区自动排到最前面、一键图钉置顶、点开一个自动收起其他、当前工作区高亮、会话状态一目了然（等你回答 / 异常中断 / 进行中 / 完成未读）、会话收藏。
 
-**当前适配目标与最低版本：DeepSeek Harness `0.2.2-rc.5`。本地版本为 `0.2.0`，尚未发布。** 最低版本声明不是对未来 DSH 版本的兼容保证；本轮验证范围与结果见后文。DSH 处于快速迭代阶段，升级后应重新回归，若插件失效，欢迎[提 Issue](https://github.com/superdadhobo/dsh-workspace-focus-enhancer/issues)。
+**当前适配目标与最低版本：DeepSeek Harness `0.2.2-rc.5`。当前版本为 `0.2.1`。** 最低版本声明不是对未来 DSH 版本的兼容保证；本轮验证范围与结果见后文。DSH 处于快速迭代阶段，升级后应重新回归，若插件失效，欢迎[提 Issue](https://github.com/superdadhobo/dsh-workspace-focus-enhancer/issues)。
 
 ---
+
+## 0.2.1 修复：橙色问号永不消失
+
+**症状**：工作区一直挂着橙色问号，点开对应会话也不消失。
+
+**根因**：橙色问号有两个来源——`ask_user_question` 的未完成调用，和未决议的审批请求（`approval/asked`）。原来的实现只在看到 `approval/decided` 时才清掉审批，但**被中断的回合不会写这条事件**：DSH 的 `approval.request()` 在 `await decide()` 之后才 `append('approval/decided')`，中断让 abort 赢得竞争、提前结束回合时，那条 append 就永远不会发生。于是这个审批 id 永远留在集合里，工作区永远是橙色。
+
+真实日志印证：某会话第 3 回合申请提权到 `danger-full-access`，随后回合以 `interrupted` 结束，180 条事件里 `approval/asked` 有 1 条、`approval/decided` 有 **0** 条。
+
+**修复**：审批和提问一样是**回合内**事件（DSH 明确要求 `approval.request()` 必须在打开的回合内调用，否则抛错），所以回合边界必须一并清掉审批：
+
+- 冷读路径（`summarizeObservation`）：`turn/start` / `turn/end` 现在同时 `clear()` 提问集合与审批集合。
+- 实时路径（`session/event`）：`turn/start` 与 `turn/end` 都 `delete` 该会话的审批集合。
+
+**验证**：在你那条真实日志上重跑插件的折叠逻辑——旧代码残留 1 个孤立审批（正是那个橙色问号），修复后为 0。新增 2 项回归测试，全量 64/64 通过。
 
 ## 0.2.0 适配 DSH 0.2.2-rc.5
 

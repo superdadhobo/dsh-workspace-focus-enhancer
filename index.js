@@ -293,7 +293,17 @@ export function apply(ctx) {
     let title;
     for (let i = observation.inheritedEventCount || 0; i < events.length; i += 1) {
       const event = events[i], data = event?.data;
-      if (event?.type === 'turn/start' || event?.type === 'turn/end') calls.clear();
+      // An approval is turn-enclosed by the Host's own contract: asking outside
+      // an open turn throws, and the tool call it gates settles when the turn
+      // ends. A turn that ends while a request is still open — the usual shape
+      // of an interrupted turn, where the abort wins the race and the matching
+      // `approval/decided` is never written — must therefore drop the request
+      // too. Without this the workspace would wear the orange question mark
+      // forever, because nothing else ever removes that id.
+      if (event?.type === 'turn/start' || event?.type === 'turn/end') {
+        calls.clear();
+        approvals.clear();
+      }
       if (!data) continue;
       if (event.type === 'approval/asked' && typeof data.id === 'string' && data.id) approvals.add(data.id);
       else if (event.type === 'approval/decided') approvals.delete(data.id);
@@ -910,6 +920,11 @@ export function apply(ctx) {
     if (event.type === 'turn/start') {
       turnFacts.set(sessionId, { turn: data.turn, reply: false, failed: false });
       openQuestions.delete(sessionId);
+      // A turn boundary closes every approval the previous turn left open, for
+      // the same reason it closes the questions: an interrupted turn can end
+      // with `approval/asked` and no matching `approval/decided`, and a request
+      // can only be answered inside the turn that asked it.
+      openApprovals.delete(sessionId);
       erroredSessions.delete(sessionId);
       unreadSessions.delete(sessionId);
     } else if (event.type === 'assistant/message') {
@@ -921,6 +936,7 @@ export function apply(ctx) {
       if (matches) finishTurn(sessionId, facts.failed ? 'error' : data.reason?.kind, facts.reply);
       turnFacts.delete(sessionId);
       openQuestions.delete(sessionId);
+      openApprovals.delete(sessionId);
     } else if (event.type === 'tool/call' && data.name === ASK_USER_TOOL && typeof data.callId === 'string' && data.callId) {
       let calls = openQuestions.get(sessionId);
       if (!calls) openQuestions.set(sessionId, calls = new Set());

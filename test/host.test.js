@@ -206,6 +206,49 @@ test('a question asked before this Host started is still found in the session lo
   assert.deepEqual((await h.call()).body.waitingSessions,[],'only the turn in flight can be parked');
 });
 
+test('an approval left open by an interrupted turn stops marking the workspace', async t => {
+  const h = await harness(t);
+  // Shape taken from a real Session log: turn 3 asks to escalate the sandbox,
+  // the abort wins the race, so the turn ends 'interrupted' and the Host never
+  // writes the matching `approval/decided`. The request is turn-enclosed by the
+  // Host's own contract, so the ended turn must retire it; otherwise the
+  // workspace wears the orange question mark forever.
+  const log = (events) => ({ id: 'sc', header: { id: 'sc' }, events });
+  const asked = { type: 'approval/asked', data: { id: 'approval-1', toolName: 'bash', callId: 'c1' } };
+  const interrupted = [
+    { type: 'turn/start', data: { turn: 3 } },
+    { type: 'tool/call', data: { name: 'bash', callId: 'c1' } },
+    asked,
+    { type: 'turn/end', data: { turn: 3, reason: { kind: 'interrupted' } } },
+  ];
+  h.sessions.push(log(interrupted));
+  assert.deepEqual((await h.call()).body.waitingSessions, [], 'a closed turn cannot still be waiting');
+
+  // While the turn is genuinely open the same approval does mark it.
+  h.sessions[0] = log([{ type: 'turn/start', data: { turn: 3 } }, asked]);
+  assert.deepEqual((await h.call()).body.waitingSessions, ['sc'], 'an open turn still reports its approval');
+
+  // A decided approval clears it inside the same turn.
+  h.sessions[0] = log([{ type: 'turn/start', data: { turn: 3 } }, asked,
+    { type: 'approval/decided', data: { id: 'approval-1', outcome: 'allowed-once' } }]);
+  assert.deepEqual((await h.call()).body.waitingSessions, [], 'a decided approval is not a wait');
+});
+
+test('a live turn boundary retires an approval the interrupted turn left open', async t => {
+  const h = await harness(t);
+  const log = (events) => ({ id: 'sc', header: { id: 'sc' }, events });
+  h.sessions.push(log([{ type: 'turn/start', data: { turn: 1 } }]));
+  assert.deepEqual((await h.call()).body.waitingSessions, []);
+  // The ask arrives on the live stream, then the turn is interrupted and a new
+  // one starts: the request must not survive into the next turn.
+  h.emit('session/event', { id: 'sc', header: { id: 'sc' } },
+    { type: 'approval/asked', data: { id: 'approval-live', toolName: 'bash' } });
+  assert.deepEqual((await h.call()).body.waitingSessions, ['sc'], 'a live ask marks the workspace');
+  h.emit('session/event', { id: 'sc', header: { id: 'sc' } },
+    { type: 'turn/end', data: { turn: 1, reason: { kind: 'interrupted' } } });
+  assert.deepEqual((await h.call()).body.waitingSessions, [], 'the ended turn retires the live ask');
+});
+
 test('a subagent still working keeps its parent workspace busy', async t => {
   const h=await harness(t);
   // The child Session is a log of its own: no workspace lists it, and the parent
